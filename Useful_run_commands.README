@@ -1,0 +1,5 @@
+sudo systemctl status winecooling winedash      # check status
+journalctl -u winecooling -f                    # follow cooling logs
+journalctl -u winedash -f                       # follow dashboard logs
+sudo systemctl restart winecooling               # restart after editing the script
+sudo systemctl stop winecooling winedash         # stop both

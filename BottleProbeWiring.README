@@ -1,0 +1,26 @@
+Good — let's map this out given what's already occupied.
+
+What's likely already in use
+Based on your existing setup:
+
+Pin 1 (3.3V) — likely powering the SHT31D sensors via the TCA9548A
+Pins 3 & 5 (GPIO2/GPIO3 — SDA/SCL) — I2C bus for the sensors
+Pin 6 (GND) — I2C ground
+Pin 9 (GND) — probably a second ground tie-point
+Pins 11 & 13 (GPIO17/GPIO27) — your two relay control pins
+
+What you need for the DS18B20 (3 connections)
+Signal	Pin needed	Status
+DATA	GPIO4 = Pin 7	✅ Free, as you said
+VDD (3.3V)	Any 3.3V pin	Pin 1 is used — use Pin 17 (second 3.3V pin) instead
+GND	Any GND pin	Pins 6 & 9 are used — use Pin 14, 20, or 25 instead (all GND)
+
+Suggested wiring given your constraints
+
+Red (VDD)         → Pin 17 (3.3V)
+Yellow (DATA)     → Pin 7  (GPIO4)
+White + Silver    → Pin 14 (GND)   -- or 20/25, any free GND works
+
+And the pull-up resistor bridges Pin 17 (3.3V) ↔ Pin 7 (GPIO4) — same as discussed, just using Pin 17 instead of Pin 1 for the 3.3V side since Pin 1 is already occupied.
+
+No conflicts — all three signals land on completely free pins, and multiple GND/3.3V pins on the header are just internally tied together anyway, so using a different GND or 3.3V pin than your existing sensors makes no electrical difference; it's purely about physical header space being free.

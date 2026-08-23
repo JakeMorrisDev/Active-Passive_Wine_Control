@@ -140,6 +140,37 @@ def downsample_for_period(df, period):
     return resampled
 
 
+PERIOD_LABELS = {
+    "7d": "Last 7 Days",
+    "month": "This Month",
+    "year": "This Year",
+    "all": "All Time",
+}
+
+
+def compute_period_stats(df):
+    """Max/min for each metric over the given period-filtered
+    dataframe, for the summary boxes shown under the graphs. Computed
+    on the raw (pre-downsample) rows so a brief spike/dip isn't
+    averaged away by downsample_for_period()'s resampling."""
+    stats = {}
+    for key, col in (
+        ("inside_temp", "inside_temp_c"),
+        ("outside_temp", "outside_temp_c"),
+        ("bottle_temp", "bottle_temp_c"),
+        ("inside_humidity", "inside_humidity_pct"),
+        ("outside_humidity", "outside_humidity_pct"),
+    ):
+        if col in df.columns and df[col].notna().any():
+            stats[key] = {
+                "max": f"{df[col].max():.1f}",
+                "min": f"{df[col].min():.1f}",
+            }
+        else:
+            stats[key] = None
+    return stats
+
+
 # ── Status colouring ──────────────────────────────────────
 # Simple traffic-light colouring against our target ranges. "ok" is
 # comfortably within target, "warn" is outside target but only
@@ -560,6 +591,43 @@ GRAPHS_TEMPLATE = """
             margin-bottom: 10px;
         }
 
+        .summary-stats {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+            max-width: 900px;
+            margin: 20px auto 10px;
+        }
+        .summary-row {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 16px;
+            width: 100%;
+        }
+        .summary-card {
+            background: #1e1e1e;
+            border: 2px solid #444;
+            border-radius: 12px;
+            padding: 14px 18px;
+            min-width: 150px;
+        }
+        .summary-card .label {
+            color: #aaa;
+            font-size: 0.8em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 6px;
+        }
+        .summary-card .minmax {
+            font-size: 1.1em;
+            font-weight: bold;
+        }
+        .summary-card .minmax .max { color: #e6a700; }
+        .summary-card .minmax .min { color: #2980b9; }
+        .summary-card .minmax .sep { color: #666; font-weight: normal; }
+
         .no-data { color: #f66; margin-top: 40px; }
     </style>
 </head>
@@ -577,6 +645,44 @@ GRAPHS_TEMPLATE = """
     {% if has_data %}
     <div class="charts">
         {{ combined_chart | safe }}
+    </div>
+
+    <p class="subtitle">Max / Min — {{ period_label }}</p>
+    <div class="summary-stats">
+        <div class="summary-row">
+            {% if stats['bottle_temp'] %}
+            <div class="summary-card">
+                <div class="label">Bottle Temp</div>
+                <div class="minmax"><span class="max">{{ stats['bottle_temp']['max'] }}°C</span><span class="sep"> / </span><span class="min">{{ stats['bottle_temp']['min'] }}°C</span></div>
+            </div>
+            {% endif %}
+            {% if stats['inside_temp'] %}
+            <div class="summary-card">
+                <div class="label">Inside Temp</div>
+                <div class="minmax"><span class="max">{{ stats['inside_temp']['max'] }}°C</span><span class="sep"> / </span><span class="min">{{ stats['inside_temp']['min'] }}°C</span></div>
+            </div>
+            {% endif %}
+            {% if stats['outside_temp'] %}
+            <div class="summary-card">
+                <div class="label">Outside Temp</div>
+                <div class="minmax"><span class="max">{{ stats['outside_temp']['max'] }}°C</span><span class="sep"> / </span><span class="min">{{ stats['outside_temp']['min'] }}°C</span></div>
+            </div>
+            {% endif %}
+        </div>
+        <div class="summary-row">
+            {% if stats['inside_humidity'] %}
+            <div class="summary-card">
+                <div class="label">Inside Humidity</div>
+                <div class="minmax"><span class="max">{{ stats['inside_humidity']['max'] }}%</span><span class="sep"> / </span><span class="min">{{ stats['inside_humidity']['min'] }}%</span></div>
+            </div>
+            {% endif %}
+            {% if stats['outside_humidity'] %}
+            <div class="summary-card">
+                <div class="label">Outside Humidity</div>
+                <div class="minmax"><span class="max">{{ stats['outside_humidity']['max'] }}%</span><span class="sep"> / </span><span class="min">{{ stats['outside_humidity']['min'] }}%</span></div>
+            </div>
+            {% endif %}
+        </div>
     </div>
     {% else %}
         <p class="no-data">No log data found yet at {{ log_file }}.</p>
@@ -671,6 +777,7 @@ def graphs():
         )
 
     filtered = filter_by_period(df, period)
+    stats = compute_period_stats(filtered)
     filtered = downsample_for_period(filtered, period)
 
     chart_config = {"displayModeBar": False, "responsive": True}
@@ -682,6 +789,8 @@ def graphs():
         has_data=True,
         log_file=LOG_FILE,
         period=period,
+        period_label=PERIOD_LABELS.get(period, ""),
+        stats=stats,
         last_updated=df["timestamp"].iloc[-1].strftime("%Y-%m-%d %H:%M:%S"),
         combined_chart=combined_chart,
     )

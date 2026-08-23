@@ -46,11 +46,26 @@ except ImportError:
     print("w1thermsensor not installed - continuing without bottle probe.")
 
 # ── Control targets ─────────────────────────────────────
-TEMP_TARGET_MIN = 11.5      # °C - ideal cellar minimum
 TEMP_TARGET_MAX = 17.5      # °C - ideal cellar maximum
 TEMP_HYSTERESIS = 0.5       # °C - avoid rapid on/off cycling
 
-HUMIDITY_TARGET_MIN = 65.0  # %
+# Cooling keeps running anytime outside is usefully cooler than
+# inside, all the way down to this floor - not just until back within
+# the ideal band. Banking extra cooling whenever it's free (instead
+# of stopping the moment it's "good enough") gives more thermal
+# margin to burn through once a heatwave takes that opportunity away.
+COOLING_TEMP_FLOOR = 12.0    # °C - stop opportunistic cooling here
+
+# Mirror of the floor above for the cold side - only bother
+# warm-venting/warm-assisting once inside drops below this.
+WARMING_TEMP_CEILING = 10.0  # °C - only warm below this
+
+# Dehumidify keeps running anytime outside air is usefully drier than
+# inside, all the way down to this floor - not just until back within
+# the ideal band. Same rationale as COOLING_TEMP_FLOOR: bank extra
+# drying whenever it's free instead of stopping the moment it's
+# "good enough".
+HUMIDITY_TARGET_MIN = 65.0  # % - stop opportunistic dehumidify here
 HUMIDITY_TARGET_MAX = 80.0  # %
 HUMIDITY_HYSTERESIS = 2.0   # %
 
@@ -94,11 +109,11 @@ DEHUMIDIFY_TARGET_MAX_RH = 80.0  # % - ceiling we're protecting against
 # tighten it in winter.
 OUTSIDE_ABS_MIN_TEMP = 6.0       # °C
 
-# Extra margin below TEMP_TARGET_MIN - we won't run the intake fan if
-# doing so risks pulling inside temp below (TEMP_TARGET_MIN - margin).
-# This lets the "effective" outside minimum track your seasonal
-# target adjustments rather than being a fixed number you must
-# remember to update separately.
+# Extra margin below COOLING_TEMP_FLOOR - we won't run the intake fan
+# if doing so risks pulling inside temp below (COOLING_TEMP_FLOOR -
+# margin). This lets the "effective" outside minimum track that floor
+# rather than being a fixed number you must remember to update
+# separately.
 OUTSIDE_MIN_TEMP_MARGIN = 2.0    # °C
 
 POLL_INTERVAL_SECONDS = 300      # how often we read sensors & make decisions
@@ -159,7 +174,7 @@ def calculate_abs_humidity(temp_c, rh_pct):
     vapour per cubic metre of air - unlike RH, this doesn't change
     just because temperature changes, only when moisture content
     actually changes."""
-    saturation_vp = 6.112 * math.exp((17.67 * temp_c) / (temp_c + 243.5))
+    saturation_vp = 6.112 * math.exp((17.62 * temp_c) / (temp_c + 243.12))
     return 216.7 * (rh_pct / 100.0 * saturation_vp) / (273.15 + temp_c)
 
 
@@ -170,7 +185,7 @@ def max_allowable_abs_humidity(inside_temp, target_max_rh=DEHUMIDIFY_TARGET_MAX_
     rather than a fixed RH% - it tightens as the cellar cools and
     relaxes as the cellar warms, tracking the actual condensation/
     over-humidify risk rather than an arbitrary flat number."""
-    saturation_vp = 6.112 * math.exp((17.67 * inside_temp) / (inside_temp + 243.5))
+    saturation_vp = 6.112 * math.exp((17.62 * inside_temp) / (inside_temp + 243.12))
     return 216.7 * (target_max_rh / 100.0 * saturation_vp) / (273.15 + inside_temp)
 
 
@@ -266,22 +281,19 @@ def decide_fan_state(readings, current_state):
     # ── 1. Safety check: is outside air cold enough to be a risk? ──
     # Hard absolute floor.
     outside_too_cold_abs = outside_temp < OUTSIDE_ABS_MIN_TEMP
-    # Seasonal/relative floor - don't undercut our target minimum by
+    # Seasonal/relative floor - don't undercut our cooling floor by
     # more than the configured margin.
-    outside_too_cold_relative = outside_temp < (TEMP_TARGET_MIN - OUTSIDE_MIN_TEMP_MARGIN)
+    outside_too_cold_relative = outside_temp < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN)
     intake_blocked_by_cold = outside_too_cold_abs or outside_too_cold_relative
 
-    # ── 1b. Safety check: is outside air both hotter AND more humid
-    # than our targets (e.g. a summer afternoon)? If so, block the
-    # extractor entirely - in COOLING mode it pulls that air straight
-    # in via the intake fan, and even in DEHUMIDIFY-only mode the
-    # negative pressure it creates draws the same bad air in through
-    # gaps/infiltration. Either way we'd be actively making both the
-    # heat and humidity problem worse, so this overrides the more
-    # granular dew-point/absolute-humidity checks below.
-    extractor_blocked_by_hot_humid = (
-        outside_temp > TEMP_TARGET_MAX and outside_humidity > HUMIDITY_TARGET_MAX
-    )
+    # ── 1b. Safety check: is outside air hotter than our ideal max?
+    # If so, block bringing it in entirely (either fan) - in COOLING
+    # mode it pulls that air straight in via the intake fan, and even
+    # in DEHUMIDIFY-only mode the negative pressure it creates draws
+    # the same hot air in through gaps/infiltration. Either way we'd
+    # be working directly against the temperature goal, regardless of
+    # how humid that air is.
+    outside_too_hot = outside_temp > TEMP_TARGET_MAX
 
     # ── 1c. Safety check: is outside air too cold to gamble the
     # extractor-only warm-assist on? We can't tell whether its makeup
@@ -291,16 +303,18 @@ def decide_fan_state(readings, current_state):
     warm_assist_blocked_by_cold_outside = outside_too_cold_abs
 
     # ── 2. Cooling check ─────────────────────────────────
-    # Trigger cooling if inside is above max (+ hysteresis if not
-    # already cooling), outside is usefully cooler than inside, and
-    # the cold-safety check above doesn't block intake air.
+    # Trigger cooling if inside is above the cooling floor (+
+    # hysteresis if not already cooling) - deliberately keeps going
+    # well past TEMP_TARGET_MAX so we bank extra cooling whenever it's
+    # free - outside is usefully cooler than inside, and the
+    # cold-safety check above doesn't block intake air.
     if current_state == FANS_COOLING:
-        cooling_temp_trigger = inside_temp > TEMP_TARGET_MAX
+        cooling_temp_trigger = inside_temp > COOLING_TEMP_FLOOR
     else:
-        cooling_temp_trigger = inside_temp > (TEMP_TARGET_MAX + TEMP_HYSTERESIS)
+        cooling_temp_trigger = inside_temp > (COOLING_TEMP_FLOOR + TEMP_HYSTERESIS)
 
     outside_cool_enough = outside_temp < (
-        inside_temp - required_temp_advantage(inside_temp - TEMP_TARGET_MAX)
+        inside_temp - required_temp_advantage(inside_temp - COOLING_TEMP_FLOOR)
     )
 
     # Moisture check: cooling mode actively pushes outside air in via
@@ -319,7 +333,7 @@ def decide_fan_state(readings, current_state):
         and outside_cool_enough
         and cooling_wont_overhumidify
         and not intake_blocked_by_cold
-        and not extractor_blocked_by_hot_humid
+        and not outside_too_hot
     ):
         return FANS_COOLING
 
@@ -331,19 +345,19 @@ def decide_fan_state(readings, current_state):
     # in warmer air, not colder. Still gated by the same moisture
     # ceiling so we don't fix the cold at the cost of over-humidifying.
     if current_state == FANS_WARM_VENT:
-        warming_temp_trigger = inside_temp < TEMP_TARGET_MIN
+        warming_temp_trigger = inside_temp < WARMING_TEMP_CEILING
     else:
-        warming_temp_trigger = inside_temp < (TEMP_TARGET_MIN - TEMP_HYSTERESIS)
+        warming_temp_trigger = inside_temp < (WARMING_TEMP_CEILING - TEMP_HYSTERESIS)
 
     outside_warm_enough = outside_temp > (
-        inside_temp + required_temp_advantage(TEMP_TARGET_MIN - inside_temp)
+        inside_temp + required_temp_advantage(WARMING_TEMP_CEILING - inside_temp)
     )
 
     if (
         warming_temp_trigger
         and outside_warm_enough
         and cooling_wont_overhumidify
-        and not extractor_blocked_by_hot_humid
+        and not outside_too_hot
     ):
         return FANS_WARM_VENT
 
@@ -366,10 +380,14 @@ def decide_fan_state(readings, current_state):
     # nothing, rather than vent via an unknown infiltration path.
     dehumidify_blocked_by_hot_inside = inside_temp > TEMP_TARGET_MAX
 
+    # Trigger dehumidify if inside humidity is above the floor (+
+    # hysteresis if not already dehumidifying) - deliberately keeps
+    # going well past HUMIDITY_TARGET_MAX so we bank extra drying
+    # whenever it's free, same rationale as the cooling floor above.
     if current_state == FANS_DEHUMIDIFY:
-        humidity_trigger = inside_humidity > HUMIDITY_TARGET_MAX
+        humidity_trigger = inside_humidity > HUMIDITY_TARGET_MIN
     else:
-        humidity_trigger = inside_humidity > (HUMIDITY_TARGET_MAX + HUMIDITY_HYSTERESIS)
+        humidity_trigger = inside_humidity > (HUMIDITY_TARGET_MIN + HUMIDITY_HYSTERESIS)
 
     # Don't bother extracting unless outside air is meaningfully drier
     # in absolute terms.
@@ -390,7 +408,7 @@ def decide_fan_state(readings, current_state):
     if (
         humidity_trigger
         and outside_dewpoint_ok
-        and not extractor_blocked_by_hot_humid
+        and not outside_too_hot
         and not dehumidify_blocked_by_hot_inside
     ):
         return FANS_DEHUMIDIFY
@@ -401,16 +419,16 @@ def decide_fan_state(readings, current_state):
     # Runs the extractor alone, gambling that its makeup air is drawn
     # more from the adjoining (heated) house than from outside -
     # skipped if that gamble is blocked by cold outside air, or if
-    # outside is hot+humid (same safety flag as everywhere else).
+    # outside is too hot (same safety flag as everywhere else).
     if current_state == FANS_WARM_ASSIST:
-        cold_trigger = inside_temp < TEMP_TARGET_MIN
+        cold_trigger = inside_temp < WARMING_TEMP_CEILING
     else:
-        cold_trigger = inside_temp < (TEMP_TARGET_MIN - TEMP_HYSTERESIS)
+        cold_trigger = inside_temp < (WARMING_TEMP_CEILING - TEMP_HYSTERESIS)
 
     if (
         cold_trigger
         and not warm_assist_blocked_by_cold_outside
-        and not extractor_blocked_by_hot_humid
+        and not outside_too_hot
     ):
         return FANS_WARM_ASSIST
 

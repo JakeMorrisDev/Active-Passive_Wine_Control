@@ -10,14 +10,32 @@ This script ONLY reads the log file. It never touches GPIO and never
 controls the fans - that's entirely handled by RunWineCooling.py,
 which should keep running as its own separate process.
 """
-
 import os
+import json
 from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from flask import Flask, request, render_template_string
+from flask import Flask, request, redirect, url_for, render_template_string
+from WineCellarShared import (
+    TEMP_TARGET_MAX,
+    HUMIDITY_TARGET_MIN,
+    HUMIDITY_TARGET_MAX,
+    COOLING_TEMP_FLOOR,
+    OUTSIDE_ABS_MIN_TEMP,
+    OUTSIDE_MIN_TEMP_MARGIN,
+    OVERRIDE_FILE,
+    MANUAL_TEMP_VIOLATION_TIMEOUT_SECONDS,
+    MANUAL_HUMIDITY_TIMEOUT_MIN_SECONDS,
+    MANUAL_HUMIDITY_TIMEOUT_MAX_SECONDS,
+    MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS,
+    calculate_abs_humidity,
+    max_allowable_abs_humidity,
+    manual_humidity_timeout_seconds,
+    read_override,
+    write_override,
+)
 
 # ── Config ────────────────────────────────────────────────
 LOG_FILE = "/home/jakem/WineCellarManagerCode/wine_cellar_log.csv"
@@ -25,7 +43,6 @@ LOG_FILE = "/home/jakem/WineCellarManagerCode/wine_cellar_log.csv"
 # LOG_FILE = "/home/jakem/wine_cellar_log_test.csv"
 
 PORT = 5000
-DEFAULT_HOURS_TO_SHOW = 24
 AUTO_REFRESH_SECONDS = 300
 
 # How long each poll represents, in minutes - must match
@@ -38,12 +55,8 @@ POLL_INTERVAL_MINUTES = 5
 # many minutes out of the log interval (e.g. 10+ of 15 minutes = on).
 FAN_ON_THRESHOLD_MINUTES = 10
 
-# ── Target ranges (mirror RunWineCooling.py so colours reflect the
-# same thresholds the control logic actually uses) ──────────────
-TEMP_TARGET_MIN = 11.5      # °C
-TEMP_TARGET_MAX = 17.5      # °C
-HUMIDITY_TARGET_MIN = 65.0  # %
-HUMIDITY_TARGET_MAX = 80.0  # %
+# ── Target ranges ─────────────────────────────────────────────────
+TEMP_TARGET_MIN = 11.5      # °C - display lower bound only; no control equivalent in Shared
 
 app = Flask(__name__)
 
@@ -63,11 +76,6 @@ def load_log():
     except Exception as e:
         print(f"Failed to read log: {e}")
         return None
-
-
-def filter_recent(df, hours):
-    cutoff = datetime.now() - timedelta(hours=hours)
-    return df[df["timestamp"] >= cutoff]
 
 
 def filter_by_period(df, period):
@@ -169,6 +177,105 @@ def compute_period_stats(df):
         else:
             stats[key] = None
     return stats
+
+
+# ── Manual fan overrides (dashboard side) ──────────────────────────
+def fan_override_status(overrides, fan_key, fan_currently_on):
+    """Return label, next_label, note and is_manual for a fan's current 4-state display."""
+    entry = overrides.get(fan_key, {})
+    state = entry.get("state")
+    started_from_on = entry.get("started_from_on")
+
+    if state is None:
+        label = "Auto On" if fan_currently_on else "Auto Off"
+        next_label = "\u2192 Off" if fan_currently_on else "\u2192 On"
+        return {"label": label, "next_label": next_label, "note": None, "is_manual": False}
+
+    label = "Manual On" if state == "on" else "Manual Off"
+    if started_from_on:
+        next_label = "\u2192 On" if state == "off" else "\u2192 Auto"
+    else:
+        next_label = "\u2192 Off" if state == "on" else "\u2192 Auto"
+
+    note = None
+    if not entry.get("validated"):
+        note = "applying..."
+    elif entry.get("expires_at"):
+        try:
+            remaining = datetime.fromisoformat(entry["expires_at"]) - datetime.now()
+            minutes = max(0, int(remaining.total_seconds() // 60))
+            note = f"overriding a {entry.get('reason', 'safety')} check, reverts in ~{minutes} min"
+        except Exception:
+            pass
+
+    return {"label": label, "next_label": next_label, "note": note, "is_manual": True}
+
+
+def estimate_intake_risk(inside_temp, inside_humidity, outside_temp, outside_humidity):
+    """Best-effort preview (using the dashboard's own latest reading,
+    which may be up to ~15 min stale) of what RunWineCooling.py would
+    decide for a fresh manual intake-on override - just for the
+    confirmation popup text, not authoritative."""
+    temp_violation = (
+        outside_temp < OUTSIDE_ABS_MIN_TEMP
+        or outside_temp < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN)
+        or outside_temp > TEMP_TARGET_MAX
+    )
+    if temp_violation:
+        return "temp", MANUAL_TEMP_VIOLATION_TIMEOUT_SECONDS
+
+    outside_abs_humidity = calculate_abs_humidity(outside_temp, outside_humidity)
+    if outside_abs_humidity > max_allowable_abs_humidity(inside_temp):
+        return "humidity", manual_humidity_timeout_seconds(inside_humidity)
+
+    return None, None
+
+
+def estimate_extractor_risk(outside_temp):
+    """Mirrors evaluate_extractor_violation() in RunWineCooling.py."""
+    return outside_temp > TEMP_TARGET_MAX
+
+
+def cycle_override(fan_key, overrides, fan_currently_on):
+    """Return an updated overrides dict after one button press on fan_key.
+    Advancing through the 3-step cycle back to Auto clears both fans."""
+    entry = overrides.get(fan_key, {})
+    current_state = entry.get("state")        # "on", "off", or None (Auto)
+    started_from_on = entry.get("started_from_on")
+
+    if current_state is None:
+        # Starting a fresh cycle: first press goes to the opposite of the current auto state.
+        new_overrides = dict(overrides)
+        new_overrides[fan_key] = {
+            "state": "off" if fan_currently_on else "on",
+            "started_from_on": fan_currently_on,
+            "set_at": datetime.now().isoformat(),
+            "validated": False,
+            "expires_at": None,
+        }
+        return new_overrides
+
+    # Advancing within an existing manual cycle:
+    # started_from_on=True:  Auto(On) → Off → On → Auto
+    # started_from_on=False: Auto(Off) → On → Off → Auto
+    if started_from_on:
+        next_state = "on" if current_state == "off" else None
+    else:
+        next_state = "off" if current_state == "on" else None
+
+    if next_state is None:
+        # Cycle complete: clear BOTH fans and return to Auto.
+        return {k: v for k, v in overrides.items() if k not in ("extractor", "intake")}
+
+    new_overrides = dict(overrides)
+    new_overrides[fan_key] = {
+        "state": next_state,
+        "started_from_on": started_from_on,
+        "set_at": datetime.now().isoformat(),
+        "validated": False,
+        "expires_at": None,
+    }
+    return new_overrides
 
 
 # ── Status colouring ──────────────────────────────────────
@@ -359,34 +466,70 @@ PAGE_TEMPLATE = """
             gap: 24px;
             margin: 30px 0;
         }
-        .fan-badges {
+        .fan-controls {
             display: flex;
-            flex-direction: column;
-            gap: 10px;
             justify-content: center;
+            gap: 16px;
+            margin: 20px 0;
+            flex-wrap: wrap;
         }
-        .fan-badge {
-            border-radius: 12px;
-            padding: 10px 20px;
-            flex: 1;
+        .fan-control-card {
+            border-radius: 16px;
+            padding: 16px 20px;
             background: #1e1e1e;
             border: 2px solid var(--status-colour);
-            text-align: center;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
+            min-width: 170px;
         }
-        .fan-badge .label {
+        .fan-control-card .label {
             color: #aaa;
             font-size: 0.8em;
             text-transform: uppercase;
             letter-spacing: 1px;
         }
-        .fan-badge .value {
+        .fan-control-card .value {
             font-size: 1.4em;
             font-weight: bold;
             color: var(--status-colour);
+            margin: 4px 0;
         }
+        .fan-control-card .manual-note {
+            color: #e6a700;
+            font-size: 0.75em;
+            margin-bottom: 8px;
+        }
+        .fan-buttons {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+        }
+        .fan-buttons form {
+            margin: 0;
+        }
+        .fan-buttons button {
+            background: #292929;
+            border: 1px solid #555;
+            border-radius: 8px;
+            padding: 6px 12px;
+            color: #eee;
+            font-size: 0.85em;
+            cursor: pointer;
+        }
+        .fan-buttons button:hover {
+            border-color: #6cf;
+        }
+        .auto-button {
+            background: #1e1e1e;
+            border: 2px solid #6cf;
+            border-radius: 10px;
+            padding: 12px 28px;
+            color: #6cf;
+            font-size: 1em;
+            cursor: pointer;
+        }
+        .auto-button:hover {
+            background: #23313a;
+        }
+
         .stat-card.compact {
             padding: 12px 24px;
             display: flex;
@@ -480,29 +623,41 @@ PAGE_TEMPLATE = """
     <p class="subtitle">Last updated: {{ last_updated }}</p>
 
     {% if has_data %}
-    {% if has_bottle_temp or has_fan_status %}
+    {% if has_bottle_temp %}
     <div class="bottle-stats">
-        {% if has_bottle_temp %}
         <div class="stat-card compact" style="--status-colour: {{ bottle_colour }};">
             <div class="label">Bottle Temp</div>
             <div class="value">{{ bottle_temp }}°C</div>
             <div class="target">Target: {{ temp_target_min }}–{{ temp_target_max }}°C</div>
         </div>
-        {% endif %}
-        {% if has_fan_status %}
-        <div class="fan-badges">
-            <div class="fan-badge" style="--status-colour: {{ intake_colour }};">
-                <div class="label">Intake</div>
-                <div class="value">{{ intake_text }}</div>
-            </div>
-            <div class="fan-badge" style="--status-colour: {{ extractor_colour }};">
-                <div class="label">Extractor</div>
-                <div class="value">{{ extractor_text }}</div>
-            </div>
-        </div>
-        {% endif %}
     </div>
     {% endif %}
+
+    {% if has_fan_status %}
+    <div class="fan-controls">
+        <div class="fan-control-card" style="--status-colour: {{ intake_colour }};">
+            <div class="label">Intake</div>
+            <div class="value">{{ intake_status.label }}</div>
+            {% if intake_status.note %}<div class="manual-note">{{ intake_status.note }}</div>{% endif %}
+            <div class="fan-buttons">
+                <form method="post" action="/fan/intake/cycle"{% if intake_confirm %} onsubmit="return confirm({{ intake_confirm|tojson }});"{% endif %}>
+                    <button type="submit">{{ intake_status.next_label }}</button>
+                </form>
+            </div>
+        </div>
+        <div class="fan-control-card" style="--status-colour: {{ extractor_colour }};">
+            <div class="label">Extractor</div>
+            <div class="value">{{ extractor_status.label }}</div>
+            {% if extractor_status.note %}<div class="manual-note">{{ extractor_status.note }}</div>{% endif %}
+            <div class="fan-buttons">
+                <form method="post" action="/fan/extractor/cycle"{% if extractor_confirm %} onsubmit="return confirm({{ extractor_confirm|tojson }});"{% endif %}>
+                    <button type="submit">{{ extractor_status.next_label }}</button>
+                </form>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
     <div class="inside-stats">
         <div class="stat-card" style="--status-colour: {{ temp_colour }};">
             <div class="label">Inside Temp</div>
@@ -526,6 +681,10 @@ PAGE_TEMPLATE = """
             <div class="value">{{ outside_humidity }}%</div>
         </div>
     </div>
+
+    {% if active_warning %}
+    <div class="warning-banner">⚠ {{ active_warning }}</div>
+    {% endif %}
 
     <div class="nav-buttons">
         <a href="/graphs">📈 View Graphs</a>
@@ -708,6 +867,7 @@ def dashboard():
             log_file=LOG_FILE,
             last_updated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             refresh_seconds=AUTO_REFRESH_SECONDS,
+            active_warning=None,
         )
 
     latest = df.iloc[-1]
@@ -732,6 +892,55 @@ def dashboard():
     else:
         extractor_on = intake_on = False
 
+    overrides = read_override()
+    intake_status = fan_override_status(overrides, "intake", intake_on)
+    extractor_status = fan_override_status(overrides, "extractor", extractor_on)
+    active_warning = overrides.get("warning")
+
+    intake_colour = STATUS_COLOURS["warn"] if intake_status["is_manual"] else FAN_STATUS_COLOURS[intake_on]
+    extractor_colour = STATUS_COLOURS["warn"] if extractor_status["is_manual"] else FAN_STATUS_COLOURS[extractor_on]
+
+    # Confirmation only needed when the next step is → On (the step that changes what air enters).
+    intake_confirm = None
+    if intake_status["next_label"] == "\u2192 On":
+        intake_risk_category, intake_risk_timeout = estimate_intake_risk(
+            inside_temp, inside_humidity, outside_temp, outside_humidity)
+        if intake_risk_category == "temp":
+            intake_confirm = (
+                "Force the INTAKE fan ON?\n\nOutside currently violates a temperature "
+                "safety check (too cold or too hot to bring in). If that still holds "
+                "once RunWineCooling.py confirms it, this will auto-revert to Auto in "
+                f"about {int(intake_risk_timeout // 60)} min."
+            )
+        elif intake_risk_category == "humidity":
+            intake_confirm = (
+                "Force the INTAKE fan ON?\n\nThis air currently looks too humid for "
+                "the cellar's ceiling. If that still holds once confirmed, this will "
+                f"auto-revert to Auto in about {int(intake_risk_timeout // 60)} min."
+            )
+        else:
+            direction = "cooler" if outside_temp < inside_temp else "warmer"
+            intake_confirm = (
+                f"Force the INTAKE fan ON?\n\nOutside ({outside_temp:.1f}\u00b0C) is "
+                f"currently {direction} than inside ({inside_temp:.1f}\u00b0C) and "
+                "looks safe right now - it'll stay on until you turn it off, but will "
+                "still revert automatically if conditions change and violate a safety check."
+            )
+
+    extractor_confirm = None
+    if extractor_status["next_label"] == "\u2192 On":
+        if estimate_extractor_risk(outside_temp):
+            extractor_confirm = (
+                f"Force the EXTRACTOR fan ON?\n\nOutside is {outside_temp:.1f}\u00b0C "
+                f"(above {TEMP_TARGET_MAX:.1f}\u00b0C) \u2013 may warm the cellar if outdoor "
+                f"air infiltrates. Will auto-revert in ~{MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS // 60} min."
+            )
+        else:
+            extractor_confirm = (
+                "Force the EXTRACTOR fan ON?\n\nThis stays on until you turn it off. "
+                f"Will auto-revert if outside rises above {TEMP_TARGET_MAX:.1f}\u00b0C."
+            )
+
     return render_template_string(
         PAGE_TEMPLATE,
         has_data=True,
@@ -745,13 +954,16 @@ def dashboard():
         has_bottle_temp=has_bottle_temp,
         bottle_temp=f"{bottle_temp:.1f}" if has_bottle_temp else None,
         has_fan_status=has_fan_status,
-        intake_text="On" if intake_on else "Off",
-        extractor_text="On" if extractor_on else "Off",
-        intake_colour=FAN_STATUS_COLOURS[intake_on],
-        extractor_colour=FAN_STATUS_COLOURS[extractor_on],
+        intake_colour=intake_colour,
+        extractor_colour=extractor_colour,
+        intake_status=intake_status,
+        extractor_status=extractor_status,
+        intake_confirm=intake_confirm,
+        extractor_confirm=extractor_confirm,
         temp_colour=STATUS_COLOURS[temp_status(inside_temp)],
         humidity_colour=STATUS_COLOURS[humidity_status(inside_humidity)],
         bottle_colour=STATUS_COLOURS[bottle_temp_status(bottle_temp)] if has_bottle_temp else None,
+        active_warning=active_warning,
         temp_target_min=TEMP_TARGET_MIN,
         temp_target_max=TEMP_TARGET_MAX,
         humidity_target_min=HUMIDITY_TARGET_MIN,
@@ -794,6 +1006,44 @@ def graphs():
         last_updated=df["timestamp"].iloc[-1].strftime("%Y-%m-%d %H:%M:%S"),
         combined_chart=combined_chart,
     )
+
+
+# ── Manual fan override routes ─────────────────────────────────────
+@app.route("/fan/<fan_name>/<action>", methods=["POST"])
+def set_fan_override(fan_name, action):
+    if fan_name not in ("intake", "extractor") or action not in ("on", "off"):
+        return ("Invalid request", 400)
+
+    overrides = read_override()
+    overrides[fan_name] = {
+        "state": action,
+        "set_at": datetime.now().isoformat(),
+        "validated": False,
+        "expires_at": None,
+    }
+    write_override(overrides)
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/fan/<fan_name>/cycle", methods=["POST"])
+def cycle_fan(fan_name):
+    if fan_name not in ("intake", "extractor"):
+        return ("Invalid request", 400)
+
+    df = load_log()
+    fan_currently_on = False
+    if df is not None and "extractor_polls_on" in df.columns and "intake_polls_on" in df.columns:
+        latest = add_fan_on_off_columns(df.iloc[[-1]]).iloc[-1]
+        fan_currently_on = bool(latest[f"{fan_name}_on"])
+
+    write_override(cycle_override(fan_name, read_override(), fan_currently_on))
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/fan/auto-all", methods=["POST"])
+def clear_fan_overrides():
+    write_override({})
+    return redirect(url_for("dashboard"))
 
 
 if __name__ == "__main__":

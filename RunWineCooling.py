@@ -453,10 +453,11 @@ def resolve_extractor_override(readings, overrides, auto_value):
         if evaluate_extractor_violation(readings):
             timeout = MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS
             outside_temp = readings["outside_temp"]
+            inside_temp = readings["inside_temp"]
             entry["expires_at"] = (now + timedelta(seconds=timeout)).isoformat()
             entry["reason"] = "temp"
-            print(f"Extractor override: outside {outside_temp:.1f}°C (max {TEMP_TARGET_MAX:.1f}°C) - reverts in {timeout // 60} min")
-            overrides["warning"] = f"Extractor forced on: outside {outside_temp:.1f}°C (max {TEMP_TARGET_MAX:.1f}°C) – reverts in ~{timeout // 60} min"
+            print(f"Extractor override: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C - reverts in {timeout // 60} min")
+            overrides["warning"] = f"Extractor forced on: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C \u2013 reverts in ~{timeout // 60} min"
         return True, True
 
     expires_at = entry.get("expires_at")

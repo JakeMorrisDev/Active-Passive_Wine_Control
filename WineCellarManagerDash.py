@@ -231,9 +231,9 @@ def estimate_intake_risk(inside_temp, inside_humidity, outside_temp, outside_hum
     return None, None
 
 
-def estimate_extractor_risk(outside_temp):
+def estimate_extractor_risk(outside_temp, inside_temp):
     """Mirrors evaluate_extractor_violation() in RunWineCooling.py."""
-    return outside_temp > TEMP_TARGET_MAX
+    return outside_temp > inside_temp
 
 
 def cycle_override(fan_key, overrides, fan_currently_on):
@@ -929,11 +929,11 @@ def dashboard():
 
     extractor_confirm = None
     if extractor_status["next_label"] == "\u2192 On":
-        if estimate_extractor_risk(outside_temp):
+        if estimate_extractor_risk(outside_temp, inside_temp):
             extractor_confirm = (
                 f"Force the EXTRACTOR fan ON?\n\nOutside is {outside_temp:.1f}\u00b0C "
-                f"(above {TEMP_TARGET_MAX:.1f}\u00b0C) \u2013 may warm the cellar if outdoor "
-                f"air infiltrates. Will auto-revert in ~{MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS // 60} min."
+                f"(warmer than the cellar at {inside_temp:.1f}\u00b0C) \u2013 may warm it further if "
+                f"outdoor air infiltrates. Will auto-revert in ~{MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS // 60} min."
             )
         else:
             extractor_confirm = (

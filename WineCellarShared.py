@@ -130,9 +130,9 @@ def evaluate_extractor_violation(readings):
     extractor-on override, or a manual intake-off override that
     leaves the extractor running alone) - its air source is ambiguous
     (outside vs. the house), so it can't be bounded with a timeout, we
-    just watch for outside becoming hotter than our ideal max. Only
-    needs "outside_temp" from `readings`."""
-    return readings["outside_temp"] > TEMP_TARGET_MAX
+    just watch for outside becoming warmer than inside. Only needs
+    "inside_temp" and "outside_temp" from `readings`."""
+    return readings["outside_temp"] > readings["inside_temp"]
 
 
 def read_override():

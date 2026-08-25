@@ -216,8 +216,12 @@ def decide_fan_state(readings, current_state):
     PRIORITY ORDER (highest first):
       1. Safety     - never run intake fan if outside air is too cold;
                       never gamble on extractor-only infiltration for
-                      warmth if outside is at our hard cold floor; never
-                      run the extractor at all if outside is hot+humid.
+                      warmth if outside is at our hard cold floor.
+                      For extractor-only modes the hot-outside check is
+                      per-mode: dehumidify blocks when outside > inside
+                      (with hysteresis); warm-assist caps at TEMP_TARGET_MAX.
+                      Cooling/warm-vent need no hot-outside check because
+                      outside_cool/warm_enough already gates them.
       2. Cooling    - bring in outside air to cool the cellar. This is
                       the primary goal of a passive/assisted cellar, so
                       it always beats humidity/warmth control.
@@ -254,14 +258,25 @@ def decide_fan_state(readings, current_state):
     outside_too_cold_relative = outside_temp < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN)
     intake_blocked_by_cold = outside_too_cold_abs or outside_too_cold_relative
 
-    # ── 1b. Safety check: is outside air hotter than our ideal max?
-    # If so, block bringing it in entirely (either fan) - in COOLING
-    # mode it pulls that air straight in via the intake fan, and even
-    # in DEHUMIDIFY-only mode the negative pressure it creates draws
-    # the same hot air in through gaps/infiltration. Either way we'd
-    # be working directly against the temperature goal, regardless of
-    # how humid that air is.
-    outside_too_hot = outside_temp > TEMP_TARGET_MAX
+    # ── 1b. Safety checks for extractor-only modes ───────────────────────────
+    # Both dehumidify and warm-assist run the extractor alone, so their makeup
+    # air source is ambiguous (outside vs. house). The hot-outside check is
+    # deliberately different for each:
+    #
+    # Dehumidify: block when outside is warmer than inside - the relative check
+    # matches the manual-extractor logic and is right for a mode whose only
+    # goal is removing moisture (any warming side-effect is unwanted).
+    # Hysteresis stops short-cycling right at the boundary.
+    if current_state == FANS_DEHUMIDIFY:
+        dehumidify_blocked_by_hot_outside = outside_temp > (inside_temp + TEMP_HYSTERESIS)
+    else:
+        dehumidify_blocked_by_hot_outside = outside_temp > inside_temp
+
+    # Warm-assist: use an absolute cap at TEMP_TARGET_MAX rather than a
+    # relative inside-temp check. Warm-assist is *trying* to raise the cellar
+    # temp, so outside being warmer than inside is normal and desirable; we
+    # only need to prevent infiltration from overshooting the target ceiling.
+    warm_assist_blocked_by_hot_outside = outside_temp > TEMP_TARGET_MAX
 
     # ── 1c. Safety check: is outside air too cold to gamble the
     # extractor-only warm-assist on? We can't tell whether its makeup
@@ -301,7 +316,6 @@ def decide_fan_state(readings, current_state):
         and outside_cool_enough
         and cooling_wont_overhumidify
         and not intake_blocked_by_cold
-        and not outside_too_hot
     ):
         return FANS_COOLING
 
@@ -325,7 +339,6 @@ def decide_fan_state(readings, current_state):
         warming_temp_trigger
         and outside_warm_enough
         and cooling_wont_overhumidify
-        and not outside_too_hot
     ):
         return FANS_WARM_VENT
 
@@ -346,7 +359,7 @@ def decide_fan_state(readings, current_state):
     # block dehumidify-only mode whenever inside is too hot - in that
     # state we'd rather actively cool (if outside allows) or do
     # nothing, rather than vent via an unknown infiltration path.
-    dehumidify_blocked_by_hot_inside = inside_temp > TEMP_TARGET_MAX
+    dehumidify_blocked_by_hot_inside = inside_temp > 15.0  # headroom against warm house infiltration
 
     # Trigger dehumidify if inside humidity is above the floor (+
     # hysteresis if not already dehumidifying) - deliberately keeps
@@ -376,7 +389,7 @@ def decide_fan_state(readings, current_state):
     if (
         humidity_trigger
         and outside_dewpoint_ok
-        and not outside_too_hot
+        and not dehumidify_blocked_by_hot_outside
         and not dehumidify_blocked_by_hot_inside
     ):
         return FANS_DEHUMIDIFY
@@ -387,7 +400,8 @@ def decide_fan_state(readings, current_state):
     # Runs the extractor alone, gambling that its makeup air is drawn
     # more from the adjoining (heated) house than from outside -
     # skipped if that gamble is blocked by cold outside air, or if
-    # outside is too hot (same safety flag as everywhere else).
+    # outside has already exceeded TEMP_TARGET_MAX (infiltration could
+    # then overshoot the ceiling with no way to stop it).
     if current_state == FANS_WARM_ASSIST:
         cold_trigger = inside_temp < WARMING_TEMP_CEILING
     else:
@@ -396,7 +410,7 @@ def decide_fan_state(readings, current_state):
     if (
         cold_trigger
         and not warm_assist_blocked_by_cold_outside
-        and not outside_too_hot
+        and not warm_assist_blocked_by_hot_outside
     ):
         return FANS_WARM_ASSIST
 
@@ -629,11 +643,22 @@ def main():
                 desired_state = decide_fan_state(readings, current_state)
 
                 # Only switching *away* from an active state is guarded; switching in from OFF is not.
+                # Safety-triggered transitions (outside crossed a hard limit) bypass the guard.
                 time_in_state = time.monotonic() - state_started_at
+                _ot = readings["outside_temp"]
+                _it = readings["inside_temp"]
+                safety_triggered = (
+                    _ot < OUTSIDE_ABS_MIN_TEMP
+                    or _ot < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN)
+                    or (_ot > _it and current_state in (FANS_COOLING, FANS_DEHUMIDIFY))
+                    or (_ot < _it and current_state == FANS_WARM_VENT)
+                    or (_ot > TEMP_TARGET_MAX and current_state == FANS_WARM_ASSIST)
+                )
                 if (
                     current_state != FANS_OFF
                     and desired_state != current_state
                     and time_in_state < MIN_RUN_SECONDS
+                    and not safety_triggered
                 ):
                     print(
                         f"Holding {current_state} - min run time not yet reached "

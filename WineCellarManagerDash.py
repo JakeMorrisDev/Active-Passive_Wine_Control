@@ -219,7 +219,7 @@ def estimate_intake_risk(inside_temp, inside_humidity, outside_temp, outside_hum
     temp_violation = (
         outside_temp < OUTSIDE_ABS_MIN_TEMP
         or outside_temp < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN)
-        or outside_temp > TEMP_TARGET_MAX
+        or outside_temp > inside_temp
     )
     if temp_violation:
         return "temp", MANUAL_TEMP_VIOLATION_TIMEOUT_SECONDS

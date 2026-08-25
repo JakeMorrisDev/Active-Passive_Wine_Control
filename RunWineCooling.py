@@ -518,7 +518,7 @@ def resolve_intake_override(readings, overrides, auto_value, extractor_on_result
                 elif outside_temp < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN):
                     detail = f"outside {outside_temp:.1f}°C (risks undercooling)"
                 else:
-                    detail = f"outside {outside_temp:.1f}°C (max {TEMP_TARGET_MAX:.1f}°C)"
+                    detail = f"outside {outside_temp:.1f}°C > inside {inside_temp:.1f}°C"
             else:
                 timeout = manual_humidity_timeout_seconds(readings["inside_humidity"])
                 detail = f"outside air too humid at {inside_temp:.1f}°C cellar"

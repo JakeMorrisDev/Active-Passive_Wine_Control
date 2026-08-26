@@ -517,18 +517,6 @@ PAGE_TEMPLATE = """
         .fan-buttons button:hover {
             border-color: #6cf;
         }
-        .auto-button {
-            background: #1e1e1e;
-            border: 2px solid #6cf;
-            border-radius: 10px;
-            padding: 12px 28px;
-            color: #6cf;
-            font-size: 1em;
-            cursor: pointer;
-        }
-        .auto-button:hover {
-            background: #23313a;
-        }
 
         .stat-card.compact {
             padding: 12px 24px;
@@ -882,17 +870,11 @@ def dashboard():
     has_bottle_temp = "bottle_temp_c" in df.columns and pd.notna(latest.get("bottle_temp_c"))
     bottle_temp = latest["bottle_temp_c"] if has_bottle_temp else None
 
-    # Fan on/off badges: derive from the latest row's poll counts,
-    # same rounding rule used for the fan activity chart.
-    has_fan_status = "extractor_polls_on" in df.columns and "intake_polls_on" in df.columns
-    if has_fan_status:
-        latest_with_fans = add_fan_on_off_columns(df.iloc[[-1]]).iloc[-1]
-        extractor_on = bool(latest_with_fans["extractor_on"])
-        intake_on = bool(latest_with_fans["intake_on"])
-    else:
-        extractor_on = intake_on = False
-
     overrides = read_override()
+    # Use live relay state written by RunWineCooling.py each poll - accurate within 10 s.
+    extractor_on = bool(overrides.get("relay_extractor", False))
+    intake_on = bool(overrides.get("relay_intake", False))
+    has_fan_status = "relay_extractor" in overrides
     intake_status = fan_override_status(overrides, "intake", intake_on)
     extractor_status = fan_override_status(overrides, "extractor", extractor_on)
     active_warning = overrides.get("warning")
@@ -1030,21 +1012,10 @@ def cycle_fan(fan_name):
     if fan_name not in ("intake", "extractor"):
         return ("Invalid request", 400)
 
-    df = load_log()
-    fan_currently_on = False
-    if df is not None and "extractor_polls_on" in df.columns and "intake_polls_on" in df.columns:
-        latest = add_fan_on_off_columns(df.iloc[[-1]]).iloc[-1]
-        fan_currently_on = bool(latest[f"{fan_name}_on"])
-
-    write_override(cycle_override(fan_name, read_override(), fan_currently_on))
+    overrides = read_override()
+    fan_currently_on = bool(overrides.get(f"relay_{fan_name}", False))
+    write_override(cycle_override(fan_name, overrides, fan_currently_on))
     return redirect(url_for("dashboard"))
-
-
-@app.route("/fan/auto-all", methods=["POST"])
-def clear_fan_overrides():
-    write_override({})
-    return redirect(url_for("dashboard"))
-
 
 if __name__ == "__main__":
     print(f"Wine cellar dashboard running at http://<pi-ip>:{PORT}")

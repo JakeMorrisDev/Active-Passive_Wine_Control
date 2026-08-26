@@ -108,18 +108,9 @@ POLL_INTERVAL_SECONDS = 300      # how often we read sensors & make decisions
 LOG_INTERVAL_SECONDS = 900       # how often we write a row to the CSV log
 OVERRIDE_CHECK_SECONDS = 10      # how often to check for new override requests between polls
 
-#These were for tetsing
+#These were for testing
 #POLL_INTERVAL_SECONDS = 15
 #LOG_INTERVAL_SECONDS = 30
-#MIN_RUN_SECONDS = 20
-
-# Minimum time a fan state must run before we allow switching away
-# from it. Protects the fan motors/relay from short-cycling if
-# conditions hover right around a threshold. Does not apply to the
-# very first transition out of FANS_OFF (there's nothing to protect
-# there).
-
-MIN_RUN_SECONDS = 600
 
 # ── CSV logging ───────────────────────────────────────────
 LOG_FILE = "/home/jakem/WineCellarManagerCode/wine_cellar_log.csv"
@@ -458,6 +449,7 @@ def resolve_extractor_override(readings, overrides, auto_value):
         return auto_value, False
 
     if entry["state"] == "off":
+        entry["validated"] = True
         return False, True
 
     now = datetime.now()
@@ -518,6 +510,7 @@ def resolve_intake_override(readings, overrides, auto_value, extractor_on_result
             print("Intake-off override: extractor alone, hot-outside check hit - reverting to auto")
             del overrides["intake"]
             return auto_value, False
+        entry["validated"] = True
         return False, True
 
     if not entry.get("validated"):
@@ -615,6 +608,8 @@ def _resolve_and_drive(readings, current_state):
     intake_on, intake_manual = resolve_intake_override(
         readings, overrides, auto_intake_on, extractor_on
     )
+    overrides["relay_extractor"] = extractor_on
+    overrides["relay_intake"] = intake_on
     if json.dumps(overrides, sort_keys=True) != before:
         write_override(overrides)
     drive_relays(extractor_on, intake_on)
@@ -623,7 +618,6 @@ def _resolve_and_drive(readings, current_state):
 
 def main():
     current_state = FANS_OFF
-    state_started_at = time.monotonic()
     last_log_at = time.monotonic()
     extractor_polls_on = 0
     intake_polls_on = 0
@@ -642,40 +636,13 @@ def main():
                 last_readings = readings
                 desired_state = decide_fan_state(readings, current_state)
 
-                # Only switching *away* from an active state is guarded; switching in from OFF is not.
-                # Safety-triggered transitions (outside crossed a hard limit) bypass the guard.
-                time_in_state = time.monotonic() - state_started_at
-                _ot = readings["outside_temp"]
-                _it = readings["inside_temp"]
-                safety_triggered = (
-                    _ot < OUTSIDE_ABS_MIN_TEMP
-                    or _ot < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN)
-                    or (_ot > _it and current_state in (FANS_COOLING, FANS_DEHUMIDIFY))
-                    or (_ot < _it and current_state == FANS_WARM_VENT)
-                    or (_ot > TEMP_TARGET_MAX and current_state == FANS_WARM_ASSIST)
-                )
-                if (
-                    current_state != FANS_OFF
-                    and desired_state != current_state
-                    and time_in_state < MIN_RUN_SECONDS
-                    and not safety_triggered
-                ):
+                if desired_state != current_state:
                     print(
-                        f"Holding {current_state} - min run time not yet reached "
-                        f"({time_in_state:.0f}s / {MIN_RUN_SECONDS}s)"
-                    )
-                    new_state = current_state
-                else:
-                    new_state = desired_state
-
-                if new_state != current_state:
-                    print(
-                        f"Auto state change: {current_state} -> {new_state} | "
+                        f"Auto state change: {current_state} -> {desired_state} | "
                         f"inside={readings['inside_temp']:.1f}C/{readings['inside_humidity']:.1f}% "
                         f"outside={readings['outside_temp']:.1f}C/{readings['outside_humidity']:.1f}%"
                     )
-                    current_state = new_state
-                    state_started_at = time.monotonic()
+                    current_state = desired_state
 
                 extractor_on, intake_on, is_manual = _resolve_and_drive(readings, current_state)
 

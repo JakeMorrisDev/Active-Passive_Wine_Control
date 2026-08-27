@@ -20,12 +20,14 @@ from WineCellarShared import (
     HUMIDITY_TARGET_MIN,
     HUMIDITY_TARGET_MAX,
     OVERRIDE_FILE,
+    SENSOR_RETRY_DELAY_SECONDS,
     calculate_abs_humidity,
     max_allowable_abs_humidity,
     evaluate_intake_violation,
     evaluate_extractor_violation,
     read_override,
     write_override,
+    log_sensor_error,
 )
 
 # ── GPIO setup ──────────────────────────────────────────
@@ -175,7 +177,13 @@ def read_sensors():
     a CELLAR sensor read failure so the caller can skip this cycle
     safely rather than crash. The bottle probe is independent - if
     it's missing/fails, "bottle_temp" is just None and everything
-    else continues as normal."""
+    else continues as normal.
+
+    On failure, the real exception is logged to the sensor error log
+    (in addition to the console print) so intermittent I2C issues -
+    bus noise, relay-switching EMI, an SHT31D clock-stretch timeout -
+    can be diagnosed after the fact rather than only being visible if
+    someone was watching the console live."""
     try:
         inside_temp = sensor_inside.temperature
         inside_humidity = sensor_inside.relative_humidity
@@ -193,7 +201,30 @@ def read_sensors():
         }
     except Exception as e:
         print(f"Sensor read failed: {e}")
+        log_sensor_error(f"Sensor read failed: {type(e).__name__}: {e}")
         return None
+
+
+def read_sensors_with_retry():
+    """Try the cellar sensors; on failure wait SENSOR_RETRY_DELAY_SECONDS
+    and try exactly once more before giving up for this poll cycle.
+    Most I2C glitches are transient and gone within a few seconds, so
+    one retry recovers most failures instead of losing a full
+    POLL_INTERVAL_SECONDS cycle to them. Both the failure and the
+    retry outcome are recorded in the sensor error log."""
+    readings = read_sensors()
+    if readings is not None:
+        return readings
+
+    log_sensor_error(f"Initial read failed - retrying in {SENSOR_RETRY_DELAY_SECONDS}s")
+    time.sleep(SENSOR_RETRY_DELAY_SECONDS)
+
+    readings = read_sensors()
+    if readings is None:
+        log_sensor_error("Retry also failed - skipping this poll cycle")
+    else:
+        log_sensor_error("Retry succeeded")
+    return readings
 
 
 def decide_fan_state(readings, current_state):
@@ -592,7 +623,7 @@ def main():
     try:
         while True:
             poll_start = time.monotonic()
-            readings = read_sensors()
+            readings = read_sensors_with_retry()
 
             if readings is not None:
                 last_readings = readings
@@ -620,19 +651,28 @@ def main():
                 if intake_on:
                     intake_polls_on += 1
 
-                now = time.monotonic()
-                if now - last_log_at >= LOG_INTERVAL_SECONDS:
-                    log_reading(
-                        readings,
-                        display_state,
-                        extractor_polls_on,
-                        intake_polls_on,
-                        polls_this_interval,
-                    )
-                    last_log_at = now
-                    extractor_polls_on = 0
-                    intake_polls_on = 0
-                    polls_this_interval = 0
+            # ── Log-interval check runs every cycle regardless of whether
+            # THIS cycle's sensor read succeeded, using whatever the most
+            # recent good reading was (last_readings). Previously this
+            # check lived inside the `if readings is not None:` block above,
+            # so a poll cycle that failed both its initial read and its
+            # retry would skip the check entirely - pushing the next
+            # successful log out to ~20+ minutes instead of a steady 15.
+            # Keeping this unconditional keeps the CSV log cadence tied to
+            # wall-clock time rather than to sensor read luck.
+            now = time.monotonic()
+            if last_readings is not None and now - last_log_at >= LOG_INTERVAL_SECONDS:
+                log_reading(
+                    last_readings,
+                    display_state,
+                    extractor_polls_on,
+                    intake_polls_on,
+                    polls_this_interval,
+                )
+                last_log_at = now
+                extractor_polls_on = 0
+                intake_polls_on = 0
+                polls_this_interval = 0
 
             # ── Check for new override requests between full sensor polls ──
             while True:

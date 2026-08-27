@@ -13,6 +13,7 @@ as a side effect of import).
 import os
 import json
 import math
+from datetime import datetime
 
 # ── Control targets ─────────────────────────────────────
 TEMP_TARGET_MAX = 17.5      # °C - ideal cellar maximum
@@ -55,6 +56,20 @@ MANUAL_TEMP_VIOLATION_TIMEOUT_SECONDS = 5 * 60        # 5 min, flat
 MANUAL_HUMIDITY_TIMEOUT_MIN_SECONDS = 30 * 60         # 30 min - little/no headroom
 MANUAL_HUMIDITY_TIMEOUT_MAX_SECONDS = 2 * 60 * 60     # 2 hours - full headroom
 MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS = 30 * 60       # 30 min - risk is slower (infiltration, not direct intake)
+
+# ── Sensor error logging ────────────────────────────────────────
+# Separate from the CSV data log - this is a plain text append log of
+# sensor READ FAILURES specifically (with the real exception message),
+# so intermittent I2C/1-Wire issues can be diagnosed after the fact
+# without needing to have been watching the console/journal live.
+SENSOR_ERROR_LOG_FILE = "/home/jakem/WineCellarManagerCode/sensor_errors.log"
+
+# How long to wait before retrying once after a failed sensor read.
+# Most I2C glitches (bus noise, relay-switching EMI, a momentary
+# clock-stretch timeout on the SHT31D) are transient and gone within
+# a few seconds, so one retry recovers most failures instead of
+# losing a full poll cycle to them.
+SENSOR_RETRY_DELAY_SECONDS = 30
 
 
 def calculate_abs_humidity(temp_c, rh_pct):
@@ -156,3 +171,21 @@ def write_override(overrides):
             json.dump(overrides, f)
     except Exception as e:
         print(f"Failed to write override file: {e}")
+
+
+def log_sensor_error(message):
+    """Append a timestamped line to the sensor error log. Console
+    output via print() is easy to lose (systemd journal rotation, not
+    watching the terminal live), so sensor failures also get written
+    somewhere durable and easy to tail/grep:
+
+        tail -f /home/jakem/WineCellarManagerCode/sensor_errors.log
+
+    Never raises - a failure to write this log should never itself
+    take down the control loop."""
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    try:
+        with open(SENSOR_ERROR_LOG_FILE, "a") as f:
+            f.write(f"{timestamp} {message}\n")
+    except Exception as e:
+        print(f"Failed to write sensor error log: {e}")

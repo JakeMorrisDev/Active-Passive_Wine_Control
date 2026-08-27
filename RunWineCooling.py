@@ -9,7 +9,7 @@ import time
 import csv
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 import math
 
 from WineCellarShared import (
@@ -20,11 +20,8 @@ from WineCellarShared import (
     HUMIDITY_TARGET_MIN,
     HUMIDITY_TARGET_MAX,
     OVERRIDE_FILE,
-    MANUAL_TEMP_VIOLATION_TIMEOUT_SECONDS,
-    MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS,
     calculate_abs_humidity,
     max_allowable_abs_humidity,
-    manual_humidity_timeout_seconds,
     evaluate_intake_violation,
     evaluate_extractor_violation,
     read_override,
@@ -67,10 +64,9 @@ except ImportError:
 
 # ── Control targets ─────────────────────────────────────
 # TEMP_TARGET_MAX, COOLING_TEMP_FLOOR, HUMIDITY_TARGET_MIN/MAX,
-# OUTSIDE_ABS_MIN_TEMP and OUTSIDE_MIN_TEMP_MARGIN now live in
-# WineCellarShared.py, since the dashboard's manual-override logic
-# needs the exact same values.
-TEMP_HYSTERESIS = 0.5       # °C - avoid rapid on/off cycling
+# OUTSIDE_ABS_MIN_TEMP and OUTSIDE_MIN_TEMP_MARGIN live in
+# WineCellarShared.py
+TEMP_HYSTERESIS = 0.3       # °C - avoid rapid on/off cycling
 
 # Mirror of COOLING_TEMP_FLOOR for the cold side - only bother
 # warm-venting/warm-assisting once inside drops below this.
@@ -443,7 +439,7 @@ def _override_entry(overrides, fan_key):
 
 
 def resolve_extractor_override(readings, overrides, auto_value):
-    """Mirrors intake: timed if already hot at validation, untimed but instant-revert if clean."""
+    """Forced on runs until user-chosen timer expires; violations warn but don't revert."""
     entry = _override_entry(overrides, "extractor")
     if entry is None:
         return auto_value, False
@@ -457,25 +453,15 @@ def resolve_extractor_override(readings, overrides, auto_value):
     if not entry.get("validated"):
         entry["validated"] = True
         if evaluate_extractor_violation(readings):
-            timeout = MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS
             outside_temp = readings["outside_temp"]
             inside_temp = readings["inside_temp"]
-            entry["expires_at"] = (now + timedelta(seconds=timeout)).isoformat()
-            entry["reason"] = "temp"
-            print(f"Extractor override: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C - reverts in {timeout // 60} min")
-            overrides["warning"] = f"Extractor forced on: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C \u2013 reverts in ~{timeout // 60} min"
+            print(f"Extractor override: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C - warning only")
+            overrides["warning"] = f"Extractor forced on: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C"
         return True, True
 
     expires_at = entry.get("expires_at")
-    if expires_at:
-        if now >= datetime.fromisoformat(expires_at):
-            print("Extractor override: timed out - reverting to auto")
-            del overrides["extractor"]
-            return auto_value, False
-        return True, True
-
-    if evaluate_extractor_violation(readings):
-        print("Extractor override: hot-outside check hit - reverting to auto")
+    if expires_at and now >= datetime.fromisoformat(expires_at):
+        print("Extractor override: timed out - reverting to auto")
         del overrides["extractor"]
         return auto_value, False
 
@@ -483,20 +469,9 @@ def resolve_extractor_override(readings, overrides, auto_value):
 
 
 def resolve_intake_override(readings, overrides, auto_value, extractor_on_result):
-    """Apply a manual intake override on top of the auto decision.
-
-    Forcing OFF is safe UNLESS it leaves the extractor running alone
-    (negative pressure / unknown-source infiltration) - in that case
-    it's watched exactly like an extractor-alone override and reverts
-    instantly (no timer) if outside becomes hotter than our ideal max.
-
-    Forcing ON is checked against evaluate_intake_violation(): if it
-    was already violating a check the first time we see it, it's
-    accepted but bounded by a timeout (flat 5 min for a temp
-    violation, scaled 30 min-2 hr for a humidity violation); if it was
-    clean, it runs untimed but reverts to auto instantly the moment a
-    violation later appears - no benefit of the doubt for a risk that
-    wasn't there when it was turned on.
+    """Forced on runs until user-chosen timer expires; violations warn but don't revert.
+    Forced off still reverts instantly if it leaves the extractor running alone and
+    outside is hot (uncontrolled infiltration risk).
 
     Mutates `overrides` in place. Returns (intake_on, is_manual)."""
     entry = _override_entry(overrides, "intake")
@@ -520,7 +495,6 @@ def resolve_intake_override(readings, overrides, auto_value, extractor_on_result
             outside_temp = readings["outside_temp"]
             inside_temp = readings["inside_temp"]
             if violation == "temp":
-                timeout = MANUAL_TEMP_VIOLATION_TIMEOUT_SECONDS
                 if outside_temp < OUTSIDE_ABS_MIN_TEMP:
                     detail = f"outside {outside_temp:.1f}°C (min {OUTSIDE_ABS_MIN_TEMP:.1f}°C)"
                 elif outside_temp < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN):
@@ -528,26 +502,14 @@ def resolve_intake_override(readings, overrides, auto_value, extractor_on_result
                 else:
                     detail = f"outside {outside_temp:.1f}°C > inside {inside_temp:.1f}°C"
             else:
-                timeout = manual_humidity_timeout_seconds(readings["inside_humidity"])
                 detail = f"outside air too humid at {inside_temp:.1f}°C cellar"
-            entry["expires_at"] = (now + timedelta(seconds=timeout)).isoformat()
-            entry["reason"] = violation
-            entry["timeout_seconds"] = timeout
-            print(f"Intake override: {violation} check – {detail} – reverts in {timeout / 60:.0f} min")
-            overrides["warning"] = f"Intake forced on: {detail} – reverts in ~{timeout / 60:.0f} min"
+            print(f"Intake override: {violation} check – {detail} – warning only")
+            overrides["warning"] = f"Intake forced on: {detail}"
         return True, True
 
     expires_at = entry.get("expires_at")
-    if expires_at:
-        if now >= datetime.fromisoformat(expires_at):
-            print("Intake override: timed out - reverting to auto")
-            del overrides["intake"]
-            return auto_value, False
-        return True, True
-
-    _violation = evaluate_intake_violation(readings)
-    if _violation is not None:
-        print(f"Intake override: {_violation} check hit - reverting to auto")
+    if expires_at and now >= datetime.fromisoformat(expires_at):
+        print("Intake override: timed out - reverting to auto")
         del overrides["intake"]
         return auto_value, False
 

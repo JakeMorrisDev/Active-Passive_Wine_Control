@@ -108,6 +108,15 @@ POLL_INTERVAL_SECONDS = 300      # how often we read sensors & make decisions
 LOG_INTERVAL_SECONDS = 900       # how often we write a row to the CSV log
 OVERRIDE_CHECK_SECONDS = 10      # how often to check for new override requests between polls
 
+# Log every Nth outer poll rather than comparing elapsed wall-clock
+# time - a `now - last_log_at >= LOG_INTERVAL_SECONDS` check sits
+# right on a knife's-edge each cycle (outer polls land ~exactly
+# POLL_INTERVAL_SECONDS apart), so tiny timing jitter randomly pushed
+# some logs to the NEXT poll, silently doubling that gap (15 -> 20
+# min). Counting polls has no such boundary to trip over. Requires
+# LOG_INTERVAL_SECONDS to be an exact multiple of POLL_INTERVAL_SECONDS.
+LOG_EVERY_N_POLLS = LOG_INTERVAL_SECONDS // POLL_INTERVAL_SECONDS
+
 #These were for testing
 #POLL_INTERVAL_SECONDS = 15
 #LOG_INTERVAL_SECONDS = 30
@@ -630,7 +639,7 @@ def _resolve_and_drive(readings, current_state):
 
 def main():
     current_state = FANS_OFF
-    last_log_at = time.monotonic()
+    polls_since_log = 0
     extractor_polls_on = 0
     intake_polls_on = 0
     polls_this_interval = 0
@@ -658,6 +667,7 @@ def main():
             # happened, instead of a silent crash.
             try:
                 poll_start = time.monotonic()
+                polls_since_log += 1
                 readings = read_sensors_with_retry()
 
                 if readings is not None:
@@ -690,9 +700,8 @@ def main():
                 # whether THIS cycle's sensor read succeeded, using
                 # whatever the most recent good reading was
                 # (last_readings) - keeps the CSV log cadence tied to
-                # wall-clock time rather than to sensor read luck.
-                now = time.monotonic()
-                if last_readings is not None and now - last_log_at >= LOG_INTERVAL_SECONDS:
+                # poll count rather than to sensor read luck.
+                if last_readings is not None and polls_since_log >= LOG_EVERY_N_POLLS:
                     log_reading(
                         last_readings,
                         display_state,
@@ -700,7 +709,7 @@ def main():
                         intake_polls_on,
                         polls_this_interval,
                     )
-                    last_log_at = now
+                    polls_since_log = 0
                     extractor_polls_on = 0
                     intake_polls_on = 0
                     polls_this_interval = 0

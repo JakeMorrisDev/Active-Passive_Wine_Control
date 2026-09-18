@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from flask import Flask, request, redirect, url_for, render_template_string
+from flask import Flask, request, redirect, url_for, render_template_string, jsonify
 from WineCellarShared import (
     TEMP_TARGET_MAX,
     HUMIDITY_TARGET_MIN,
@@ -55,18 +55,31 @@ DEFAULT_DURATION_MINUTES = 5
 
 app = Flask(__name__)
 
+# Cache the parsed log in memory, keyed on the file's mtime, so a burst
+# of stats requests while zooming (see /graphs/stats) doesn't re-read
+# and re-parse the whole CSV from disk on every call - only the poll
+# loop actually changes the file (every LOG_INTERVAL_SECONDS), so the
+# cache is normally reused for many requests in a row.
+_log_cache = {"mtime": None, "df": None}
+
 
 # ── Data loading ──────────────────────────────────────────
 def load_log():
-    """Load the CSV log into a DataFrame. Returns None if the file
-    doesn't exist yet or has no rows - lets the page show a friendly
-    'no data yet' message instead of crashing."""
+    """Load the CSV log into a DataFrame, from the in-memory cache if
+    the file hasn't changed since it was last read. Returns None if
+    the file doesn't exist yet or has no rows - lets the page show a
+    friendly 'no data yet' message instead of crashing."""
     if not os.path.isfile(LOG_FILE):
         return None
     try:
+        mtime = os.path.getmtime(LOG_FILE)
+        if _log_cache["mtime"] == mtime:
+            return _log_cache["df"]
         df = pd.read_csv(LOG_FILE, parse_dates=["timestamp"])
         if df.empty:
             return None
+        _log_cache["mtime"] = mtime
+        _log_cache["df"] = df
         return df
     except Exception as e:
         print(f"Failed to read log: {e}")
@@ -87,6 +100,13 @@ def filter_by_period(df, period):
     else:  # "all"
         return df
     return df[df["timestamp"] >= cutoff]
+
+
+def filter_by_time_range(df, start, end):
+    """Rows with timestamp between start and end (inclusive) - used to
+    recompute stats for an explicit zoomed window (see /graphs/stats),
+    as opposed to filter_by_period()'s named periods."""
+    return df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
 
 
 def downsample_for_period(df, period):
@@ -168,6 +188,7 @@ def compute_period_stats(df):
             stats[key] = {
                 "max": f"{df[col].max():.1f}",
                 "min": f"{df[col].min():.1f}",
+                "mean": f"{df[col].mean():.1f}",
             }
         else:
             stats[key] = None
@@ -802,6 +823,14 @@ GRAPHS_TEMPLATE = """
         .summary-card .minmax .max { color: #e6a700; }
         .summary-card .minmax .min { color: #2980b9; }
         .summary-card .minmax .sep { color: #666; font-weight: normal; }
+        .summary-card .mean-row {
+            color: #aaa;
+            font-size: 0.85em;
+            margin-top: 6px;
+        }
+        .summary-card.stats-pending {
+            opacity: 0.5;
+        }
 
         .no-data { color: #f66; margin-top: 40px; }
     </style>
@@ -822,39 +851,44 @@ GRAPHS_TEMPLATE = """
         {{ combined_chart | safe }}
     </div>
 
-    <p class="subtitle">Max / Min — {{ period_label }}</p>
-    <div class="summary-stats">
+    <p class="subtitle">Max / Mean / Min — <span id="stats-period-label">{{ period_label }}</span></p>
+    <div class="summary-stats" id="summary-stats">
         <div class="summary-row">
             {% if stats['bottle_temp'] %}
-            <div class="summary-card">
+            <div class="summary-card" id="card-bottle_temp">
                 <div class="label">Bottle Temp</div>
-                <div class="minmax"><span class="max">{{ stats['bottle_temp']['max'] }}°C</span><span class="sep"> / </span><span class="min">{{ stats['bottle_temp']['min'] }}°C</span></div>
+                <div class="minmax"><span class="max" id="max-bottle_temp">{{ stats['bottle_temp']['max'] }}</span>°C<span class="sep"> / </span><span class="min" id="min-bottle_temp">{{ stats['bottle_temp']['min'] }}</span>°C</div>
+                <div class="mean-row">Mean: <span id="mean-bottle_temp">{{ stats['bottle_temp']['mean'] }}</span>°C</div>
             </div>
             {% endif %}
             {% if stats['inside_temp'] %}
-            <div class="summary-card">
+            <div class="summary-card" id="card-inside_temp">
                 <div class="label">Inside Temp</div>
-                <div class="minmax"><span class="max">{{ stats['inside_temp']['max'] }}°C</span><span class="sep"> / </span><span class="min">{{ stats['inside_temp']['min'] }}°C</span></div>
+                <div class="minmax"><span class="max" id="max-inside_temp">{{ stats['inside_temp']['max'] }}</span>°C<span class="sep"> / </span><span class="min" id="min-inside_temp">{{ stats['inside_temp']['min'] }}</span>°C</div>
+                <div class="mean-row">Mean: <span id="mean-inside_temp">{{ stats['inside_temp']['mean'] }}</span>°C</div>
             </div>
             {% endif %}
             {% if stats['outside_temp'] %}
-            <div class="summary-card">
+            <div class="summary-card" id="card-outside_temp">
                 <div class="label">Outside Temp</div>
-                <div class="minmax"><span class="max">{{ stats['outside_temp']['max'] }}°C</span><span class="sep"> / </span><span class="min">{{ stats['outside_temp']['min'] }}°C</span></div>
+                <div class="minmax"><span class="max" id="max-outside_temp">{{ stats['outside_temp']['max'] }}</span>°C<span class="sep"> / </span><span class="min" id="min-outside_temp">{{ stats['outside_temp']['min'] }}</span>°C</div>
+                <div class="mean-row">Mean: <span id="mean-outside_temp">{{ stats['outside_temp']['mean'] }}</span>°C</div>
             </div>
             {% endif %}
         </div>
         <div class="summary-row">
             {% if stats['inside_humidity'] %}
-            <div class="summary-card">
+            <div class="summary-card" id="card-inside_humidity">
                 <div class="label">Inside Humidity</div>
-                <div class="minmax"><span class="max">{{ stats['inside_humidity']['max'] }}%</span><span class="sep"> / </span><span class="min">{{ stats['inside_humidity']['min'] }}%</span></div>
+                <div class="minmax"><span class="max" id="max-inside_humidity">{{ stats['inside_humidity']['max'] }}</span>%<span class="sep"> / </span><span class="min" id="min-inside_humidity">{{ stats['inside_humidity']['min'] }}</span>%</div>
+                <div class="mean-row">Mean: <span id="mean-inside_humidity">{{ stats['inside_humidity']['mean'] }}</span>%</div>
             </div>
             {% endif %}
             {% if stats['outside_humidity'] %}
-            <div class="summary-card">
+            <div class="summary-card" id="card-outside_humidity">
                 <div class="label">Outside Humidity</div>
-                <div class="minmax"><span class="max">{{ stats['outside_humidity']['max'] }}%</span><span class="sep"> / </span><span class="min">{{ stats['outside_humidity']['min'] }}%</span></div>
+                <div class="minmax"><span class="max" id="max-outside_humidity">{{ stats['outside_humidity']['max'] }}</span>%<span class="sep"> / </span><span class="min" id="min-outside_humidity">{{ stats['outside_humidity']['min'] }}</span>%</div>
+                <div class="mean-row">Mean: <span id="mean-outside_humidity">{{ stats['outside_humidity']['mean'] }}</span>%</div>
             </div>
             {% endif %}
         </div>
@@ -866,6 +900,76 @@ GRAPHS_TEMPLATE = """
     <div class="nav-buttons">
         <a href="/">⬅ Back to Dashboard</a>
     </div>
+
+    {% if has_data %}
+    <script>
+        // Same metric keys the summary cards are keyed by - used to look
+        // up each card's DOM elements when applying new stats.
+        const STAT_KEYS = ["bottle_temp", "inside_temp", "outside_temp", "inside_humidity", "outside_humidity"];
+        const INITIAL_STATS = {{ stats_json | safe }};
+
+        // Bumped on every zoom/pan so a slow response that arrives after
+        // a newer one has already landed gets ignored, instead of
+        // flickering the display back to a stale range's numbers.
+        let latestStatsRequestId = 0;
+
+        function applySummaryStats(stats) {
+            for (const key of STAT_KEYS) {
+                const card = document.getElementById("card-" + key);
+                const s = stats[key];
+                if (!card || !s) continue;
+                document.getElementById("max-" + key).textContent = s.max;
+                document.getElementById("min-" + key).textContent = s.min;
+                document.getElementById("mean-" + key).textContent = s.mean;
+                card.classList.remove("stats-pending");
+            }
+        }
+
+        function markSummaryStatsPending() {
+            for (const key of STAT_KEYS) {
+                const card = document.getElementById("card-" + key);
+                if (card) card.classList.add("stats-pending");
+            }
+        }
+
+        function fetchStatsForRange(startLabel, endLabel) {
+            const requestId = ++latestStatsRequestId;
+            fetch("/graphs/stats?start=" + encodeURIComponent(startLabel) + "&end=" + encodeURIComponent(endLabel))
+                .then(r => r.json())
+                .then(stats => {
+                    if (requestId === latestStatsRequestId) applySummaryStats(stats);
+                })
+                .catch(() => {});
+        }
+
+        let statsFetchTimer = null;
+        function scheduleStatsFetch(startLabel, endLabel) {
+            markSummaryStatsPending();
+            clearTimeout(statsFetchTimer);
+            statsFetchTimer = setTimeout(() => fetchStatsForRange(startLabel, endLabel), 300);
+        }
+
+        function handleZoomChange(event) {
+            if (event["xaxis.autorange"]) {
+                // Zoom reset - restore the full-period stats instantly, no fetch needed.
+                clearTimeout(statsFetchTimer);
+                latestStatsRequestId++;
+                applySummaryStats(INITIAL_STATS);
+                return;
+            }
+            const start = event["xaxis.range[0]"];
+            const end = event["xaxis.range[1]"];
+            if (start !== undefined && end !== undefined) {
+                scheduleStatsFetch(start, end);
+            }
+        }
+
+        document.addEventListener("DOMContentLoaded", function () {
+            const graphDiv = document.querySelector(".charts .plotly-graph-div");
+            if (graphDiv) graphDiv.on("plotly_relayout", handleZoomChange);
+        });
+    </script>
+    {% endif %}
 </body>
 </html>
 """
@@ -975,9 +1079,28 @@ def graphs():
         period=period,
         period_label=PERIOD_LABELS.get(period, ""),
         stats=stats,
+        stats_json=json.dumps(stats),
         last_updated=df["timestamp"].iloc[-1].strftime("%Y-%m-%d %H:%M:%S"),
         combined_chart=combined_chart,
     )
+
+
+@app.route("/graphs/stats")
+def graphs_range_stats():
+    """JSON min/mean/max for an explicit zoomed [start, end] window,
+    computed from the full-resolution log rather than the downsampled
+    rows used for plotting, so the summary cards stay exact even when
+    zoomed into a period that's normally shown pre-averaged."""
+    df = load_log()
+    if df is None:
+        return jsonify({})
+    try:
+        start = pd.to_datetime(request.args["start"])
+        end = pd.to_datetime(request.args["end"])
+    except Exception:
+        return jsonify({}), 400
+    ranged = filter_by_time_range(df, start, end)
+    return jsonify(compute_period_stats(ranged))
 
 
 # ── Manual fan override routes ─────────────────────────────────────

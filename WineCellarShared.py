@@ -13,6 +13,7 @@ as a side effect of import).
 import os
 import json
 import math
+import traceback
 from datetime import datetime
 
 # ── Control targets ─────────────────────────────────────
@@ -57,19 +58,26 @@ MANUAL_HUMIDITY_TIMEOUT_MIN_SECONDS = 30 * 60         # 30 min - little/no headr
 MANUAL_HUMIDITY_TIMEOUT_MAX_SECONDS = 2 * 60 * 60     # 2 hours - full headroom
 MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS = 30 * 60       # 30 min - risk is slower (infiltration, not direct intake)
 
-# ── Sensor error logging ────────────────────────────────────────
-# Separate from the CSV data log - this is a plain text append log of
-# sensor READ FAILURES specifically (with the real exception message),
-# so intermittent I2C/1-Wire issues can be diagnosed after the fact
-# without needing to have been watching the console/journal live.
+# ── Error logging ────────────────────────────────────────────────
+# One plain text append log covers two things: sensor READ failures
+# specifically (log_sensor_error), and any OTHER unexpected error
+# anywhere in the control loop (log_control_error) - a corrupt
+# override file, a library hiccup, anything unanticipated. Keeping
+# both in one file means there's only one place to check after the
+# fact, rather than hunting for a silent process crash in systemd/
+# journal logs. Never watching the console live shouldn't mean
+# losing the evidence.
 SENSOR_ERROR_LOG_FILE = "/home/jakem/WineCellarManagerCode/sensor_errors.log"
 
-# How long to wait before retrying once after a failed sensor read.
-# Most I2C glitches (bus noise, relay-switching EMI, a momentary
-# clock-stretch timeout on the SHT31D) are transient and gone within
-# a few seconds, so one retry recovers most failures instead of
-# losing a full poll cycle to them.
-SENSOR_RETRY_DELAY_SECONDS = 30
+# How many attempts (including the first) to make on a sensor read
+# before giving up on this poll cycle, and how long to wait between
+# them. Most I2C glitches (bus noise, relay-switching EMI, a
+# momentary SHT31D clock-stretch timeout) clear within a few seconds,
+# so several short-spaced retries recover far more failures than a
+# single retry does, while comfortably fitting inside one
+# POLL_INTERVAL_SECONDS window (worst case here: 9 * 5s = 45s).
+SENSOR_MAX_ATTEMPTS = 10
+SENSOR_RETRY_DELAY_SECONDS = 5
 
 
 def calculate_abs_humidity(temp_c, rh_pct):
@@ -173,19 +181,41 @@ def write_override(overrides):
         print(f"Failed to write override file: {e}")
 
 
-def log_sensor_error(message):
-    """Append a timestamped line to the sensor error log. Console
-    output via print() is easy to lose (systemd journal rotation, not
-    watching the terminal live), so sensor failures also get written
-    somewhere durable and easy to tail/grep:
-
-        tail -f /home/jakem/WineCellarManagerCode/sensor_errors.log
-
-    Never raises - a failure to write this log should never itself
-    take down the control loop."""
+def _append_error_log(line):
+    """Shared append helper for SENSOR_ERROR_LOG_FILE - timestamps and
+    writes one line, never raising (a failure to write this log
+    should never itself take down the control loop)."""
     timestamp = datetime.now().isoformat(timespec="seconds")
     try:
         with open(SENSOR_ERROR_LOG_FILE, "a") as f:
-            f.write(f"{timestamp} {message}\n")
+            f.write(f"{timestamp} {line}\n")
     except Exception as e:
-        print(f"Failed to write sensor error log: {e}")
+        print(f"Failed to write error log: {e}")
+
+
+def log_sensor_error(message):
+    """Append a timestamped line to the error log for a SENSOR READ
+    failure specifically. Console output via print() is easy to lose
+    (systemd journal rotation, not watching the terminal live), so
+    these also get written somewhere durable and easy to tail/grep:
+
+        tail -f /home/jakem/WineCellarManagerCode/sensor_errors.log
+    """
+    _append_error_log(message)
+
+
+def log_control_error(exc):
+    """Append a timestamped line (with full traceback) to the SAME
+    error log, for an unexpected exception anywhere ELSE in the
+    control loop - a corrupt override file, a library error we didn't
+    anticipate, anything not already handled more specifically.
+
+    This matters because, without it, an exception like this would
+    previously propagate straight out of the main loop uncaught,
+    crash the whole script, and leave NOTHING in sensor_errors.log
+    (since it was never a sensor read failure) - which is exactly
+    consistent with "I see gaps but the log file is empty". Logging
+    it here and letting the loop continue turns a silent full crash
+    into one skipped cycle with a clear record of what happened."""
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    _append_error_log(f"CONTROL LOOP ERROR: {type(exc).__name__}: {exc}\n{tb}")

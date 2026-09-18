@@ -38,7 +38,20 @@ AUTO_REFRESH_SECONDS = 300
 # ── Target ranges ─────────────────────────────────────────────────
 TEMP_TARGET_MIN = 11.5      # °C - display lower bound only; no control equivalent in Shared
 
-ON_DURATIONS = [(5, "5m"), (15, "15m"), (30, "30m"), (60, "1h"), (120, "2h"), (180, "3h"), (240, "4h"), (300, "5h")]
+# ── Manual "on" duration options ───────────────────────────────────
+# Shown via the single slide-through duration control on each fan
+# card, rather than a grid of individual buttons. Whatever's
+# currently selected here is what gets applied whenever the
+# auto/manual toggle next cycles a fan into Manual On.
+DURATION_OPTIONS = [
+    (5, "5m"), (15, "15m"), (30, "30m"),
+    (60, "1h"), (120, "2h"), (180, "3h"),
+    (240, "4h"), (300, "5h"), (360, "6h"),
+]
+DURATION_MINUTES_LIST = [minutes for minutes, _ in DURATION_OPTIONS]
+DURATION_LABELS = dict(DURATION_OPTIONS)
+DURATION_OPTIONS_JSON = json.dumps(DURATION_OPTIONS)
+DEFAULT_DURATION_MINUTES = 5
 
 app = Flask(__name__)
 
@@ -162,34 +175,59 @@ def compute_period_stats(df):
 
 
 # ── Manual fan overrides (dashboard side) ──────────────────────────
+def get_fan_duration_minutes(overrides, fan_key):
+    """The duration (minutes) currently selected for this fan's
+    Manual On - shown on the duration pill and applied whenever the
+    toggle next cycles this fan into Manual On. Stored independently
+    of any currently-active override entry, so it persists as a
+    standing preference across auto/manual/auto cycles. Falls back to
+    the 5-minute default until the user picks something else via the
+    duration slider."""
+    return overrides.get("durations", {}).get(fan_key, DEFAULT_DURATION_MINUTES)
+
+
 def fan_override_status(overrides, fan_key, fan_currently_on):
-    """Return display state for one fan control card."""
+    """Return display state for one fan control card, including the
+    single next-tap action (for the auto/manual toggle button) and
+    the currently selected Manual On duration (for the duration
+    pill/slider)."""
     entry = overrides.get(fan_key, {})
     state = entry.get("state")
+    # step 1 = the first manual state after leaving Auto (always the
+    # OPPOSITE of whatever was actually running, so the first tap has
+    # a visible effect); step 2 = the second manual state (a tap here
+    # returns to Auto). Missing on old/malformed entries -> treat as
+    # step 1, which just means "flip to the other manual value" next,
+    # a safe fallback rather than jumping straight to Auto.
+    step = entry.get("step", 1)
+
+    duration_minutes = get_fan_duration_minutes(overrides, fan_key)
+    duration_label = DURATION_LABELS.get(duration_minutes, f"{duration_minutes}m")
+    duration_index = (
+        DURATION_MINUTES_LIST.index(duration_minutes)
+        if duration_minutes in DURATION_MINUTES_LIST
+        else 0
+    )
+    common = {
+        "duration_minutes": duration_minutes,
+        "duration_label": duration_label,
+        "duration_index": duration_index,
+    }
 
     if state is None:
-        return {
+        common.update({
             "mode": "auto_on" if fan_currently_on else "auto_off",
             "label": "Auto On" if fan_currently_on else "Auto Off",
             "note": None,
             "is_manual": False,
-            "duration_minutes": None,
-        }
+            # First tap out of Auto always forces the opposite of what's
+            # actually running right now.
+            "next_action_label": "Force Off" if fan_currently_on else "Force On",
+        })
+        return common
 
-    if state == "off":
-        return {
-            "mode": "manual_off",
-            "label": "Manual Off",
-            "note": None,
-            "is_manual": True,
-            "duration_minutes": None,
-        }
-
-    # state == "on"
     note = None
-    if not entry.get("validated"):
-        note = "applying..."
-    elif entry.get("expires_at"):
+    if entry.get("expires_at"):
         try:
             remaining = datetime.fromisoformat(entry["expires_at"]) - datetime.now()
             secs = max(0, int(remaining.total_seconds()))
@@ -198,13 +236,28 @@ def fan_override_status(overrides, fan_key, fan_currently_on):
         except Exception:
             pass
 
-    return {
+    if state == "off":
+        common.update({
+            "mode": "manual_off",
+            "label": "Manual Off",
+            "note": note,
+            "is_manual": True,
+            "next_action_label": "Force On" if step == 1 else "Back to Auto",
+        })
+        return common
+
+    # state == "on" - not yet applied by the control loop overrides its countdown note
+    if not entry.get("validated"):
+        note = "applying..."
+
+    common.update({
         "mode": "manual_on",
         "label": "Manual On",
         "note": note,
         "is_manual": True,
-        "duration_minutes": entry.get("duration_minutes"),
-    }
+        "next_action_label": "Force Off" if step == 1 else "Back to Auto",
+    })
+    return common
 
 
 # ── Status colouring ──────────────────────────────────────
@@ -350,7 +403,7 @@ def build_combined_figure(df):
     return fig
 
 
-# ── Page template (placeholder - filled in next) ─────────
+# ── Page template ──────────────────────────────────
 PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -389,7 +442,7 @@ PAGE_TEMPLATE = """
             padding: 16px 20px;
             background: #1e1e1e;
             border: 2px solid var(--status-colour);
-            min-width: 170px;
+            min-width: 190px;
         }
         .fan-control-card .label {
             color: #aaa;
@@ -408,49 +461,62 @@ PAGE_TEMPLATE = """
             font-size: 0.75em;
             margin-bottom: 8px;
         }
-        .fan-buttons {
+
+        /* ── Toggle button + duration pill, side by side, same size ── */
+        .fan-actions {
             display: flex;
-            gap: 8px;
             justify-content: center;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 10px;
         }
-        .fan-buttons form {
+        .toggle-form {
             margin: 0;
         }
-        .fan-buttons button {
+        .toggle-btn {
             background: #292929;
             border: 1px solid #555;
             border-radius: 8px;
-            padding: 6px 12px;
+            padding: 6px 14px;
             color: #eee;
             font-size: 0.85em;
             cursor: pointer;
         }
-        .fan-buttons button:hover {
+        .toggle-btn:hover {
             border-color: #6cf;
         }
-        .duration-picker {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            justify-content: center;
-            margin-bottom: 8px;
-        }
-        .duration-picker form { margin: 0; }
-        .duration-picker button {
-            background: #292929;
-            border: 1px solid #555;
-            border-radius: 8px;
-            padding: 5px 10px;
-            color: #eee;
-            font-size: 0.8em;
+        .duration-toggle-btn {
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 20px;
+            padding: 6px 14px;
+            color: #aaa;
+            font-size: 0.85em;
             cursor: pointer;
         }
-        .duration-picker button:hover,
-        .duration-picker button.active {
+        .duration-toggle-btn:hover {
             border-color: #6cf;
             color: #6cf;
         }
-        .duration-picker button.active { background: #1a2535; }
+
+        /* ── Slide-out duration picker, full width below the row ── */
+        .duration-slider-panel {
+            display: none;
+            margin-top: 10px;
+            padding: 4px 6px 0;
+        }
+        .duration-slider-panel.open {
+            display: block;
+        }
+        .duration-slider-panel input[type="range"] {
+            width: 100%;
+        }
+        .duration-slider-label {
+            color: #6cf;
+            font-size: 0.85em;
+            margin-top: 4px;
+        }
 
         .stat-card.compact {
             padding: 12px 24px;
@@ -562,27 +628,28 @@ PAGE_TEMPLATE = """
             <div class="label">{{ fan_name | title }}</div>
             <div class="value">{{ status.label }}</div>
             {% if status.note %}<div class="manual-note">{{ status.note }}</div>{% endif %}
-                        {% if status.mode in ('auto_off', 'manual_off', 'manual_on') %}
-            <div class="duration-picker">
-                {% for mins, label in on_durations %}
-                <form method="post" action="/fan/{{ fan_name }}/on/{{ mins }}">
-                    <button type="submit"{% if status.duration_minutes == mins %} class="active"{% endif %}>{{ label }}</button>
+
+            <div class="fan-actions">
+                <form method="post" action="/fan/{{ fan_name }}/toggle" class="toggle-form">
+                    <button type="submit" class="toggle-btn">{{ status.next_action_label }}</button>
                 </form>
-                {% endfor %}
+
+                {% if status.mode != 'auto_on' %}
+                <button type="button" class="duration-toggle-btn" onclick="toggleDurationSlider('{{ fan_name }}')">
+                    ⏱ {{ status.duration_label }}
+                </button>
+                {% endif %}
+            </div>
+
+            {% if status.mode != 'auto_on' %}
+            <div class="duration-slider-panel" id="duration-panel-{{ fan_name }}">
+                <input type="range" min="0" max="{{ duration_options|length - 1 }}" step="1"
+                       value="{{ status.duration_index }}"
+                       oninput="updateDurationPreview('{{ fan_name }}', this.value)"
+                       onchange="applyDuration('{{ fan_name }}', this.value)">
+                <div class="duration-slider-label" id="duration-label-{{ fan_name }}">{{ status.duration_label }}</div>
             </div>
             {% endif %}
-            <div class="fan-buttons">
-                {% if status.mode in ('auto_on', 'manual_on') %}
-                <form method="post" action="/fan/{{ fan_name }}/off">
-                    <button type="submit">→ Off</button>
-                </form>
-                {% endif %}
-                {% if status.mode in ('manual_on', 'manual_off') %}
-                <form method="post" action="/fan/{{ fan_name }}/cancel">
-                    <button type="submit">→ Auto</button>
-                </form>
-                {% endif %}
-            </div>
         </div>
         {% endfor %}
     </div>
@@ -622,6 +689,25 @@ PAGE_TEMPLATE = """
     {% else %}
         <p class="no-data">No log data found yet at {{ log_file }}.</p>
     {% endif %}
+
+    <script>
+        const DURATION_OPTIONS = {{ duration_options_json | safe }};
+
+        function toggleDurationSlider(fan) {
+            const panel = document.getElementById('duration-panel-' + fan);
+            panel.classList.toggle('open');
+        }
+
+        function updateDurationPreview(fan, index) {
+            document.getElementById('duration-label-' + fan).textContent = DURATION_OPTIONS[index][1];
+        }
+
+        function applyDuration(fan, index) {
+            const minutes = DURATION_OPTIONS[index][0];
+            fetch('/fan/' + fan + '/duration/' + minutes, { method: 'POST' })
+                .then(() => location.reload());
+        }
+    </script>
 </body>
 </html>
 """
@@ -798,6 +884,8 @@ def dashboard():
             last_updated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             refresh_seconds=AUTO_REFRESH_SECONDS,
             active_warning=None,
+            duration_options=DURATION_OPTIONS,
+            duration_options_json=DURATION_OPTIONS_JSON,
         )
 
     latest = df.iloc[-1]
@@ -842,7 +930,8 @@ def dashboard():
         extractor_colour=extractor_colour,
         intake_status=intake_status,
         extractor_status=extractor_status,
-        on_durations=ON_DURATIONS,
+        duration_options=DURATION_OPTIONS,
+        duration_options_json=DURATION_OPTIONS_JSON,
         temp_colour=STATUS_COLOURS[temp_status(inside_temp)],
         humidity_colour=STATUS_COLOURS[humidity_status(inside_humidity)],
         bottle_colour=STATUS_COLOURS[bottle_temp_status(bottle_temp)] if has_bottle_temp else None,
@@ -892,55 +981,112 @@ def graphs():
 
 
 # ── Manual fan override routes ─────────────────────────────────────
-VALID_ON_DURATIONS = {m for m, _ in ON_DURATIONS}
+VALID_DURATIONS = set(DURATION_MINUTES_LIST)
 
 
-@app.route("/fan/<fan_name>/on/<int:minutes>", methods=["POST"])
-def fan_on(fan_name, minutes):
-    if fan_name not in ("intake", "extractor") or minutes not in VALID_ON_DURATIONS:
-        return ("Invalid request", 400)
+def _fan_entry_state_and_step(overrides, fan_key):
+    """The current override (state, step) for a fan.
 
-    overrides = read_override()
-    overrides[fan_name] = {
-        "state": "on",
-        "set_at": datetime.now().isoformat(),
-        "expires_at": (datetime.now() + timedelta(minutes=minutes)).isoformat(),
+    state is "on", "off", or None (meaning Auto: no override entry
+    present, or a malformed one). step is 1 for the first manual
+    state entered after leaving Auto, 2 for the second - missing/old
+    entries default to step 1, a safe fallback (next tap just flips
+    to the other manual value rather than jumping straight to Auto)."""
+    entry = overrides.get(fan_key)
+    if not entry or entry.get("state") not in ("on", "off"):
+        return None, None
+    return entry["state"], entry.get("step", 1)
+
+
+def _manual_entry(state, overrides, fan_key, step):
+    """Build a manual override entry - shared by both Manual On and
+    Manual Off, which now both run for the selected duration before
+    reverting to Auto."""
+    minutes = get_fan_duration_minutes(overrides, fan_key)
+    now = datetime.now()
+    return {
+        "state": state,
+        "step": step,
+        "set_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=minutes)).isoformat(),
         "duration_minutes": minutes,
         "validated": False,
     }
-    write_override(overrides)
-    return redirect(url_for("dashboard"))
 
 
-@app.route("/fan/<fan_name>/off", methods=["POST"])
-def fan_off(fan_name):
+@app.route("/fan/<fan_name>/toggle", methods=["POST"])
+def fan_toggle(fan_name):
+    """Single tap-to-cycle control, in an order that depends on which
+    side Auto is actually running on right now:
+
+        Auto (running)     -> Manual Off -> Manual On  -> Auto
+        Auto (not running) -> Manual On  -> Manual Off -> Auto
+
+    i.e. the first tap out of Auto always forces the OPPOSITE of
+    whatever's actually happening, so it has a visible effect rather
+    than just pinning the current behaviour. The second manual tap
+    flips to the other value. The third returns to Auto - which then
+    falls back to whatever Auto decides live, possibly different from
+    what it was showing when the override started.
+
+    Manual On always picks up whatever duration is currently selected
+    on that fan's duration pill (get_fan_duration_minutes), defaulting
+    to 5 minutes until the user chooses otherwise via the slider."""
     if fan_name not in ("intake", "extractor"):
         return ("Invalid request", 400)
 
     overrides = read_override()
-    overrides[fan_name] = {
-        "state": "off",
-        "set_at": datetime.now().isoformat(),
-        "expires_at": None,
-        "validated": False,
-    }
+    state, step = _fan_entry_state_and_step(overrides, fan_name)
+
+    if state is None:
+        fan_currently_on = bool(overrides.get(f"relay_{fan_name}", False))
+        overrides[fan_name] = _manual_entry(
+            "off" if fan_currently_on else "on", overrides, fan_name, step=1
+        )
+    elif step == 1:
+        # First manual state -> flip to the other manual value.
+        overrides[fan_name] = _manual_entry(
+            "on" if state == "off" else "off", overrides, fan_name, step=2
+        )
+    else:
+        # Second manual state -> back to Auto.
+        overrides.pop(fan_name, None)
+
     write_override(overrides)
     return redirect(url_for("dashboard"))
 
 
-@app.route("/fan/<fan_name>/cancel", methods=["POST"])
-def fan_cancel(fan_name):
-    if fan_name not in ("intake", "extractor"):
+@app.route("/fan/<fan_name>/duration/<int:minutes>", methods=["POST"])
+def fan_duration(fan_name, minutes):
+    """Set the duration used whenever this fan's toggle next moves
+    into Manual On. Persisted independently of any active override so
+    it's remembered as a standing preference across auto/manual
+    cycles. If the fan is ALREADY Manual On, the live timer is updated
+    immediately too - recomputed from the override's original set_at
+    rather than from now, so time already spent manual isn't lost or
+    double-counted (shortening below the elapsed time just ends the
+    override promptly, which is the expected behaviour)."""
+    if fan_name not in ("intake", "extractor") or minutes not in VALID_DURATIONS:
         return ("Invalid request", 400)
 
     overrides = read_override()
-    overrides.pop(fan_name, None)
+    overrides.setdefault("durations", {})[fan_name] = minutes
+
+    entry = overrides.get(fan_name)
+    if entry and entry.get("state") in ("on", "off"):
+        try:
+            set_at = datetime.fromisoformat(entry.get("set_at"))
+        except Exception:
+            set_at = datetime.now()
+        entry["duration_minutes"] = minutes
+        entry["expires_at"] = (set_at + timedelta(minutes=minutes)).isoformat()
+
     write_override(overrides)
     return redirect(url_for("dashboard"))
+
 
 if __name__ == "__main__":
     print(f"Wine cellar dashboard running at http://<pi-ip>:{PORT}")
     # 0.0.0.0 binds to all interfaces so it's reachable from other
     # devices on the local network (phone, laptop).
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-

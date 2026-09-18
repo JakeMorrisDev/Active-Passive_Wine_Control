@@ -20,6 +20,7 @@ from WineCellarShared import (
     HUMIDITY_TARGET_MIN,
     HUMIDITY_TARGET_MAX,
     OVERRIDE_FILE,
+    SENSOR_MAX_ATTEMPTS,
     SENSOR_RETRY_DELAY_SECONDS,
     calculate_abs_humidity,
     max_allowable_abs_humidity,
@@ -28,6 +29,7 @@ from WineCellarShared import (
     read_override,
     write_override,
     log_sensor_error,
+    log_control_error,
 )
 
 # ── GPIO setup ──────────────────────────────────────────
@@ -206,25 +208,31 @@ def read_sensors():
 
 
 def read_sensors_with_retry():
-    """Try the cellar sensors; on failure wait SENSOR_RETRY_DELAY_SECONDS
-    and try exactly once more before giving up for this poll cycle.
-    Most I2C glitches are transient and gone within a few seconds, so
-    one retry recovers most failures instead of losing a full
-    POLL_INTERVAL_SECONDS cycle to them. Both the failure and the
-    retry outcome are recorded in the sensor error log."""
+    """Try the cellar sensors; on failure, retry up to
+    SENSOR_MAX_ATTEMPTS times in total, SENSOR_RETRY_DELAY_SECONDS
+    apart, before giving up for this poll cycle. Most I2C glitches
+    (bus noise, relay-switching EMI, a momentary SHT31D clock-stretch
+    timeout) clear within a few seconds, so several short-spaced
+    retries recover far more failures than a single retry does - and
+    still comfortably fit inside one POLL_INTERVAL_SECONDS window
+    (worst case here: 9 * 5s = 45s). Every attempt and outcome is
+    recorded in the sensor error log."""
     readings = read_sensors()
     if readings is not None:
         return readings
 
-    log_sensor_error(f"Initial read failed - retrying in {SENSOR_RETRY_DELAY_SECONDS}s")
-    time.sleep(SENSOR_RETRY_DELAY_SECONDS)
+    for attempt in range(2, SENSOR_MAX_ATTEMPTS + 1):
+        log_sensor_error(
+            f"Read failed - retry {attempt}/{SENSOR_MAX_ATTEMPTS} in {SENSOR_RETRY_DELAY_SECONDS}s"
+        )
+        time.sleep(SENSOR_RETRY_DELAY_SECONDS)
+        readings = read_sensors()
+        if readings is not None:
+            log_sensor_error(f"Retry {attempt}/{SENSOR_MAX_ATTEMPTS} succeeded")
+            return readings
 
-    readings = read_sensors()
-    if readings is None:
-        log_sensor_error("Retry also failed - skipping this poll cycle")
-    else:
-        log_sensor_error("Retry succeeded")
-    return readings
+    log_sensor_error(f"All {SENSOR_MAX_ATTEMPTS} attempts failed - skipping this poll cycle")
+    return None
 
 
 def decide_fan_state(readings, current_state):
@@ -470,16 +478,22 @@ def _override_entry(overrides, fan_key):
 
 
 def resolve_extractor_override(readings, overrides, auto_value):
-    """Forced on runs until user-chosen timer expires; violations warn but don't revert."""
+    """Forced on/off both run until the user-chosen timer expires; violations
+    on a forced-on only warn, they don't revert."""
     entry = _override_entry(overrides, "extractor")
     if entry is None:
         return auto_value, False
 
+    now = datetime.now()
+
     if entry["state"] == "off":
         entry["validated"] = True
+        expires_at = entry.get("expires_at")
+        if expires_at and now >= datetime.fromisoformat(expires_at):
+            print("Extractor override: manual-off timed out - reverting to auto")
+            del overrides["extractor"]
+            return auto_value, False
         return False, True
-
-    now = datetime.now()
 
     if not entry.get("validated"):
         entry["validated"] = True
@@ -517,6 +531,11 @@ def resolve_intake_override(readings, overrides, auto_value, extractor_on_result
             del overrides["intake"]
             return auto_value, False
         entry["validated"] = True
+        expires_at = entry.get("expires_at")
+        if expires_at and now >= datetime.fromisoformat(expires_at):
+            print("Intake-off override: timed out - reverting to auto")
+            del overrides["intake"]
+            return auto_value, False
         return False, True
 
     if not entry.get("validated"):
@@ -622,71 +641,88 @@ def main():
 
     try:
         while True:
-            poll_start = time.monotonic()
-            readings = read_sensors_with_retry()
+            # Everything for one poll cycle lives inside this inner
+            # try/except. Previously an unexpected exception ANYWHERE
+            # in here - a corrupt override file, a library error we
+            # didn't anticipate, anything not already handled more
+            # specifically - would propagate straight past this loop,
+            # hit `finally: GPIO.cleanup()`, and kill the whole script.
+            # Nothing would be written to sensor_errors.log in that
+            # case (it's not a sensor read failure), so the process
+            # would just silently disappear until something (systemd,
+            # or a person) noticed and restarted it - a much likelier
+            # explanation for an occasional unexplained gap with an
+            # EMPTY error log than the sensor retry path itself.
+            # Logging it via log_control_error and continuing turns
+            # that into one skipped cycle with a clear record of what
+            # happened, instead of a silent crash.
+            try:
+                poll_start = time.monotonic()
+                readings = read_sensors_with_retry()
 
-            if readings is not None:
-                last_readings = readings
-                desired_state = decide_fan_state(readings, current_state)
+                if readings is not None:
+                    last_readings = readings
+                    desired_state = decide_fan_state(readings, current_state)
 
-                if desired_state != current_state:
-                    print(
-                        f"Auto state change: {current_state} -> {desired_state} | "
-                        f"inside={readings['inside_temp']:.1f}C/{readings['inside_humidity']:.1f}% "
-                        f"outside={readings['outside_temp']:.1f}C/{readings['outside_humidity']:.1f}%"
+                    if desired_state != current_state:
+                        print(
+                            f"Auto state change: {current_state} -> {desired_state} | "
+                            f"inside={readings['inside_temp']:.1f}C/{readings['inside_humidity']:.1f}% "
+                            f"outside={readings['outside_temp']:.1f}C/{readings['outside_humidity']:.1f}%"
+                        )
+                        current_state = desired_state
+
+                    extractor_on, intake_on, is_manual = _resolve_and_drive(readings, current_state)
+
+                    new_display_state = "manual" if is_manual else current_state
+                    if new_display_state != display_state:
+                        print(f"Fan mode: {display_state} -> {new_display_state}")
+                        display_state = new_display_state
+
+                    # Poll counts use the actual post-override relay state.
+                    polls_this_interval += 1
+                    if extractor_on:
+                        extractor_polls_on += 1
+                    if intake_on:
+                        intake_polls_on += 1
+
+                # Log-interval check runs every cycle regardless of
+                # whether THIS cycle's sensor read succeeded, using
+                # whatever the most recent good reading was
+                # (last_readings) - keeps the CSV log cadence tied to
+                # wall-clock time rather than to sensor read luck.
+                now = time.monotonic()
+                if last_readings is not None and now - last_log_at >= LOG_INTERVAL_SECONDS:
+                    log_reading(
+                        last_readings,
+                        display_state,
+                        extractor_polls_on,
+                        intake_polls_on,
+                        polls_this_interval,
                     )
-                    current_state = desired_state
+                    last_log_at = now
+                    extractor_polls_on = 0
+                    intake_polls_on = 0
+                    polls_this_interval = 0
 
-                extractor_on, intake_on, is_manual = _resolve_and_drive(readings, current_state)
+                # ── Check for new override requests between full sensor polls ──
+                while True:
+                    remaining = POLL_INTERVAL_SECONDS - (time.monotonic() - poll_start)
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(OVERRIDE_CHECK_SECONDS, remaining))
+                    if last_readings is None:
+                        continue
+                    _, _, is_manual = _resolve_and_drive(last_readings, current_state)
+                    new_display_state = "manual" if is_manual else current_state
+                    if new_display_state != display_state:
+                        print(f"Fan mode: {display_state} -> {new_display_state}")
+                        display_state = new_display_state
 
-                new_display_state = "manual" if is_manual else current_state
-                if new_display_state != display_state:
-                    print(f"Fan mode: {display_state} -> {new_display_state}")
-                    display_state = new_display_state
-
-                # Poll counts use the actual post-override relay state.
-                polls_this_interval += 1
-                if extractor_on:
-                    extractor_polls_on += 1
-                if intake_on:
-                    intake_polls_on += 1
-
-            # ── Log-interval check runs every cycle regardless of whether
-            # THIS cycle's sensor read succeeded, using whatever the most
-            # recent good reading was (last_readings). Previously this
-            # check lived inside the `if readings is not None:` block above,
-            # so a poll cycle that failed both its initial read and its
-            # retry would skip the check entirely - pushing the next
-            # successful log out to ~20+ minutes instead of a steady 15.
-            # Keeping this unconditional keeps the CSV log cadence tied to
-            # wall-clock time rather than to sensor read luck.
-            now = time.monotonic()
-            if last_readings is not None and now - last_log_at >= LOG_INTERVAL_SECONDS:
-                log_reading(
-                    last_readings,
-                    display_state,
-                    extractor_polls_on,
-                    intake_polls_on,
-                    polls_this_interval,
-                )
-                last_log_at = now
-                extractor_polls_on = 0
-                intake_polls_on = 0
-                polls_this_interval = 0
-
-            # ── Check for new override requests between full sensor polls ──
-            while True:
-                remaining = POLL_INTERVAL_SECONDS - (time.monotonic() - poll_start)
-                if remaining <= 0:
-                    break
-                time.sleep(min(OVERRIDE_CHECK_SECONDS, remaining))
-                if last_readings is None:
-                    continue
-                _, _, is_manual = _resolve_and_drive(last_readings, current_state)
-                new_display_state = "manual" if is_manual else current_state
-                if new_display_state != display_state:
-                    print(f"Fan mode: {display_state} -> {new_display_state}")
-                    display_state = new_display_state
+            except Exception as e:
+                print(f"Unexpected error in control loop: {e}")
+                log_control_error(e)
+                time.sleep(5)  # brief pause so a persistent bug can't spin-loop
 
     except KeyboardInterrupt:
         print("Stopping - cleaning up GPIO.")

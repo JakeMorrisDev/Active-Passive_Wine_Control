@@ -94,6 +94,20 @@ ADVANTAGE_SCALE_RANGE = 3.0        # °C of off-target-ness over which the requi
 # Using dew point avoids being fooled by that relative-humidity effect.
 OUTSIDE_DEWPOINT_ADVANTAGE = 1.0  # °C
 
+# Cooling normally must pass max_allowable_abs_humidity()'s ceiling to
+# run - but once the cellar is hot enough, cooling takes priority over
+# the humidity target instead, gated only on outside dew point still
+# being lower (so incoming air is never wetter than what's already
+# inside). The required dew-point margin narrows from
+# COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX at
+# COOLING_HUMIDITY_OVERRIDE_TEMP_MIN down to
+# COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MIN (any advantage counts) by
+# COOLING_HUMIDITY_OVERRIDE_TEMP_MAX.
+COOLING_HUMIDITY_OVERRIDE_TEMP_MIN = 17.0      # °C
+COOLING_HUMIDITY_OVERRIDE_TEMP_MAX = 18.0      # °C
+COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX = 0.5   # °C required advantage at TEMP_MIN
+COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MIN = 0.0   # °C required advantage at TEMP_MAX
+
 # ── Dynamic humidity ceiling (replaces a fixed outside RH%) ──────
 # See max_allowable_abs_humidity() in WineCellarShared.py for the
 # full rationale - condensation/over-humidify risk depends on the
@@ -166,6 +180,20 @@ def required_temp_advantage(temp_error):
     both cooling (outside cooler) and warm-venting (outside warmer)."""
     frac = min(1.0, max(0.0, temp_error) / ADVANTAGE_SCALE_RANGE)
     return OUTSIDE_ADVANTAGE_TEMP_MAX - frac * (OUTSIDE_ADVANTAGE_TEMP_MAX - OUTSIDE_ADVANTAGE_TEMP_MIN)
+
+
+def required_dewpoint_advantage_for_cooling(inside_temp):
+    """How far outside dew point must be below inside's before cooling
+    is allowed to override the humidity ceiling, scaling from
+    COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX at
+    COOLING_HUMIDITY_OVERRIDE_TEMP_MIN down to
+    COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MIN by COOLING_HUMIDITY_OVERRIDE_TEMP_MAX -
+    mirrors required_temp_advantage()'s shape."""
+    span = COOLING_HUMIDITY_OVERRIDE_TEMP_MAX - COOLING_HUMIDITY_OVERRIDE_TEMP_MIN
+    frac = min(1.0, max(0.0, inside_temp - COOLING_HUMIDITY_OVERRIDE_TEMP_MIN) / span)
+    return COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX - frac * (
+        COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX - COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MIN
+    )
 
 
 def read_bottle_probe():
@@ -341,10 +369,20 @@ def decide_fan_state(readings, current_state):
     # otherwise we'd be solving a heat problem while creating a damp/
     # condensation one. Uses the same absolute-humidity ceiling as the
     # dehumidify check, since the physics (and the risk) are identical
-    # whenever outside air is being introduced.
+    # whenever outside air is being introduced. Once inside is hot
+    # enough though, cooling overrides that ceiling instead - gated on
+    # outside dew point still being lower, so incoming air is never
+    # actively wetter than what's already inside.
     outside_abs_humidity = calculate_abs_humidity(outside_temp, outside_humidity)
-    max_abs_humidity_for_cooling = max_allowable_abs_humidity(inside_temp)
-    cooling_wont_overhumidify = outside_abs_humidity <= max_abs_humidity_for_cooling
+    max_abs_humidity = max_allowable_abs_humidity(inside_temp)
+    normal_ceiling_ok = outside_abs_humidity <= max_abs_humidity
+
+    dewpoint_advantage = readings["inside_dewpoint"] - readings["outside_dewpoint"]
+    humidity_override_active = (
+        inside_temp >= COOLING_HUMIDITY_OVERRIDE_TEMP_MIN
+        and dewpoint_advantage >= required_dewpoint_advantage_for_cooling(inside_temp)
+    )
+    cooling_wont_overhumidify = normal_ceiling_ok or humidity_override_active
 
     if (
         cooling_temp_trigger
@@ -414,10 +452,10 @@ def decide_fan_state(readings, current_state):
     # Precise condensation/over-humidify check: would this outside air,
     # once it reaches cellar temperature, push inside RH above our
     # target ceiling? Uses absolute humidity rather than a flat dew
-    # point margin, so it's exact rather than approximated. (Reuses
-    # the same calculation as the cooling branch above, since the
-    # physics are identical.)
-    wont_overhumidify = outside_abs_humidity <= max_abs_humidity_for_cooling
+    # point margin, so it's exact rather than approximated. Uses the
+    # strict ceiling (not cooling's dew-point override) since
+    # humidity control is dehumidify-only's entire purpose.
+    wont_overhumidify = outside_abs_humidity <= max_abs_humidity
 
     outside_dewpoint_ok = outside_drier_than_inside and wont_overhumidify
 

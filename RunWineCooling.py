@@ -9,7 +9,7 @@ import time
 import csv
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 
 from WineCellarShared import (
@@ -20,16 +20,15 @@ from WineCellarShared import (
     HUMIDITY_TARGET_MIN,
     HUMIDITY_TARGET_MAX,
     OVERRIDE_FILE,
-    SENSOR_MAX_ATTEMPTS,
-    SENSOR_RETRY_DELAY_SECONDS,
+    MANUAL_TEMP_VIOLATION_TIMEOUT_SECONDS,
+    MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS,
     calculate_abs_humidity,
     max_allowable_abs_humidity,
+    manual_humidity_timeout_seconds,
     evaluate_intake_violation,
     evaluate_extractor_violation,
     read_override,
     write_override,
-    log_sensor_error,
-    log_control_error,
 )
 
 # ── GPIO setup ──────────────────────────────────────────
@@ -68,9 +67,10 @@ except ImportError:
 
 # ── Control targets ─────────────────────────────────────
 # TEMP_TARGET_MAX, COOLING_TEMP_FLOOR, HUMIDITY_TARGET_MIN/MAX,
-# OUTSIDE_ABS_MIN_TEMP and OUTSIDE_MIN_TEMP_MARGIN live in
-# WineCellarShared.py
-TEMP_HYSTERESIS = 0.3       # °C - avoid rapid on/off cycling
+# OUTSIDE_ABS_MIN_TEMP and OUTSIDE_MIN_TEMP_MARGIN now live in
+# WineCellarShared.py, since the dashboard's manual-override logic
+# needs the exact same values.
+TEMP_HYSTERESIS = 0.5       # °C - avoid rapid on/off cycling
 
 # Mirror of COOLING_TEMP_FLOOR for the cold side - only bother
 # warm-venting/warm-assisting once inside drops below this.
@@ -92,21 +92,7 @@ ADVANTAGE_SCALE_RANGE = 3.0        # °C of off-target-ness over which the requi
 # actual moisture content of the air, unlike RH (which rises at night
 # purely because temperature drops, even with no change in moisture).
 # Using dew point avoids being fooled by that relative-humidity effect.
-OUTSIDE_DEWPOINT_ADVANTAGE = 1.0  # °C
-
-# Cooling normally must pass max_allowable_abs_humidity()'s ceiling to
-# run - but once the cellar is hot enough, cooling takes priority over
-# the humidity target instead, gated only on outside dew point still
-# being lower (so incoming air is never wetter than what's already
-# inside). The required dew-point margin narrows from
-# COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX at
-# COOLING_HUMIDITY_OVERRIDE_TEMP_MIN down to
-# COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MIN (any advantage counts) by
-# COOLING_HUMIDITY_OVERRIDE_TEMP_MAX.
-COOLING_HUMIDITY_OVERRIDE_TEMP_MIN = 17.0      # °C
-COOLING_HUMIDITY_OVERRIDE_TEMP_MAX = 18.0      # °C
-COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX = 0.5   # °C required advantage at TEMP_MIN
-COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MIN = 0.0   # °C required advantage at TEMP_MAX
+OUTSIDE_DEWPOINT_ADVANTAGE = 2.5  # °C
 
 # ── Dynamic humidity ceiling (replaces a fixed outside RH%) ──────
 # See max_allowable_abs_humidity() in WineCellarShared.py for the
@@ -122,18 +108,18 @@ POLL_INTERVAL_SECONDS = 300      # how often we read sensors & make decisions
 LOG_INTERVAL_SECONDS = 900       # how often we write a row to the CSV log
 OVERRIDE_CHECK_SECONDS = 10      # how often to check for new override requests between polls
 
-# Log every Nth outer poll rather than comparing elapsed wall-clock
-# time - a `now - last_log_at >= LOG_INTERVAL_SECONDS` check sits
-# right on a knife's-edge each cycle (outer polls land ~exactly
-# POLL_INTERVAL_SECONDS apart), so tiny timing jitter randomly pushed
-# some logs to the NEXT poll, silently doubling that gap (15 -> 20
-# min). Counting polls has no such boundary to trip over. Requires
-# LOG_INTERVAL_SECONDS to be an exact multiple of POLL_INTERVAL_SECONDS.
-LOG_EVERY_N_POLLS = LOG_INTERVAL_SECONDS // POLL_INTERVAL_SECONDS
-
-#These were for testing
+#These were for tetsing
 #POLL_INTERVAL_SECONDS = 15
 #LOG_INTERVAL_SECONDS = 30
+#MIN_RUN_SECONDS = 20
+
+# Minimum time a fan state must run before we allow switching away
+# from it. Protects the fan motors/relay from short-cycling if
+# conditions hover right around a threshold. Does not apply to the
+# very first transition out of FANS_OFF (there's nothing to protect
+# there).
+
+MIN_RUN_SECONDS = 600
 
 # ── CSV logging ───────────────────────────────────────────
 LOG_FILE = "/home/jakem/WineCellarManagerCode/wine_cellar_log.csv"
@@ -182,20 +168,6 @@ def required_temp_advantage(temp_error):
     return OUTSIDE_ADVANTAGE_TEMP_MAX - frac * (OUTSIDE_ADVANTAGE_TEMP_MAX - OUTSIDE_ADVANTAGE_TEMP_MIN)
 
 
-def required_dewpoint_advantage_for_cooling(inside_temp):
-    """How far outside dew point must be below inside's before cooling
-    is allowed to override the humidity ceiling, scaling from
-    COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX at
-    COOLING_HUMIDITY_OVERRIDE_TEMP_MIN down to
-    COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MIN by COOLING_HUMIDITY_OVERRIDE_TEMP_MAX -
-    mirrors required_temp_advantage()'s shape."""
-    span = COOLING_HUMIDITY_OVERRIDE_TEMP_MAX - COOLING_HUMIDITY_OVERRIDE_TEMP_MIN
-    frac = min(1.0, max(0.0, inside_temp - COOLING_HUMIDITY_OVERRIDE_TEMP_MIN) / span)
-    return COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX - frac * (
-        COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MAX - COOLING_HUMIDITY_OVERRIDE_DEWPOINT_MIN
-    )
-
-
 def read_bottle_probe():
     """Read the bottle probe if it's connected. Returns None if the
     sensor isn't attached/installed, or if the read fails for any
@@ -216,13 +188,7 @@ def read_sensors():
     a CELLAR sensor read failure so the caller can skip this cycle
     safely rather than crash. The bottle probe is independent - if
     it's missing/fails, "bottle_temp" is just None and everything
-    else continues as normal.
-
-    On failure, the real exception is logged to the sensor error log
-    (in addition to the console print) so intermittent I2C issues -
-    bus noise, relay-switching EMI, an SHT31D clock-stretch timeout -
-    can be diagnosed after the fact rather than only being visible if
-    someone was watching the console live."""
+    else continues as normal."""
     try:
         inside_temp = sensor_inside.temperature
         inside_humidity = sensor_inside.relative_humidity
@@ -240,36 +206,7 @@ def read_sensors():
         }
     except Exception as e:
         print(f"Sensor read failed: {e}")
-        log_sensor_error(f"Sensor read failed: {type(e).__name__}: {e}")
         return None
-
-
-def read_sensors_with_retry():
-    """Try the cellar sensors; on failure, retry up to
-    SENSOR_MAX_ATTEMPTS times in total, SENSOR_RETRY_DELAY_SECONDS
-    apart, before giving up for this poll cycle. Most I2C glitches
-    (bus noise, relay-switching EMI, a momentary SHT31D clock-stretch
-    timeout) clear within a few seconds, so several short-spaced
-    retries recover far more failures than a single retry does - and
-    still comfortably fit inside one POLL_INTERVAL_SECONDS window
-    (worst case here: 9 * 5s = 45s). Every attempt and outcome is
-    recorded in the sensor error log."""
-    readings = read_sensors()
-    if readings is not None:
-        return readings
-
-    for attempt in range(2, SENSOR_MAX_ATTEMPTS + 1):
-        log_sensor_error(
-            f"Read failed - retry {attempt}/{SENSOR_MAX_ATTEMPTS} in {SENSOR_RETRY_DELAY_SECONDS}s"
-        )
-        time.sleep(SENSOR_RETRY_DELAY_SECONDS)
-        readings = read_sensors()
-        if readings is not None:
-            log_sensor_error(f"Retry {attempt}/{SENSOR_MAX_ATTEMPTS} succeeded")
-            return readings
-
-    log_sensor_error(f"All {SENSOR_MAX_ATTEMPTS} attempts failed - skipping this poll cycle")
-    return None
 
 
 def decide_fan_state(readings, current_state):
@@ -279,12 +216,8 @@ def decide_fan_state(readings, current_state):
     PRIORITY ORDER (highest first):
       1. Safety     - never run intake fan if outside air is too cold;
                       never gamble on extractor-only infiltration for
-                      warmth if outside is at our hard cold floor.
-                      For extractor-only modes the hot-outside check is
-                      per-mode: dehumidify blocks when outside > inside
-                      (with hysteresis); warm-assist caps at TEMP_TARGET_MAX.
-                      Cooling/warm-vent need no hot-outside check because
-                      outside_cool/warm_enough already gates them.
+                      warmth if outside is at our hard cold floor; never
+                      run the extractor at all if outside is hot+humid.
       2. Cooling    - bring in outside air to cool the cellar. This is
                       the primary goal of a passive/assisted cellar, so
                       it always beats humidity/warmth control.
@@ -322,23 +255,15 @@ def decide_fan_state(readings, current_state):
     intake_blocked_by_cold = outside_too_cold_abs or outside_too_cold_relative
 
     # ── 1b. Safety checks for extractor-only modes ───────────────────────────
-    # Both dehumidify and warm-assist run the extractor alone, so their makeup
-    # air source is ambiguous (outside vs. house). The hot-outside check is
-    # deliberately different for each:
-    #
-    # Dehumidify: block when outside is warmer than inside - the relative check
-    # matches the manual-extractor logic and is right for a mode whose only
-    # goal is removing moisture (any warming side-effect is unwanted).
-    # Hysteresis stops short-cycling right at the boundary.
+    # Dehumidify/warm-assist run the extractor alone so makeup air is ambiguous
+    # (outside vs. house). For dehumidify, block when outside is warmer than
+    # inside - infiltration would heat the cellar. Hysteresis prevents cycling.
     if current_state == FANS_DEHUMIDIFY:
         dehumidify_blocked_by_hot_outside = outside_temp > (inside_temp + TEMP_HYSTERESIS)
     else:
         dehumidify_blocked_by_hot_outside = outside_temp > inside_temp
 
-    # Warm-assist: use an absolute cap at TEMP_TARGET_MAX rather than a
-    # relative inside-temp check. Warm-assist is *trying* to raise the cellar
-    # temp, so outside being warmer than inside is normal and desirable; we
-    # only need to prevent infiltration from overshooting the target ceiling.
+    # Warm-assist uses uncontrolled infiltration; cap at TEMP_TARGET_MAX to prevent overshoot.
     warm_assist_blocked_by_hot_outside = outside_temp > TEMP_TARGET_MAX
 
     # ── 1c. Safety check: is outside air too cold to gamble the
@@ -369,20 +294,10 @@ def decide_fan_state(readings, current_state):
     # otherwise we'd be solving a heat problem while creating a damp/
     # condensation one. Uses the same absolute-humidity ceiling as the
     # dehumidify check, since the physics (and the risk) are identical
-    # whenever outside air is being introduced. Once inside is hot
-    # enough though, cooling overrides that ceiling instead - gated on
-    # outside dew point still being lower, so incoming air is never
-    # actively wetter than what's already inside.
+    # whenever outside air is being introduced.
     outside_abs_humidity = calculate_abs_humidity(outside_temp, outside_humidity)
-    max_abs_humidity = max_allowable_abs_humidity(inside_temp)
-    normal_ceiling_ok = outside_abs_humidity <= max_abs_humidity
-
-    dewpoint_advantage = readings["inside_dewpoint"] - readings["outside_dewpoint"]
-    humidity_override_active = (
-        inside_temp >= COOLING_HUMIDITY_OVERRIDE_TEMP_MIN
-        and dewpoint_advantage >= required_dewpoint_advantage_for_cooling(inside_temp)
-    )
-    cooling_wont_overhumidify = normal_ceiling_ok or humidity_override_active
+    max_abs_humidity_for_cooling = max_allowable_abs_humidity(inside_temp)
+    cooling_wont_overhumidify = outside_abs_humidity <= max_abs_humidity_for_cooling
 
     if (
         cooling_temp_trigger
@@ -432,7 +347,7 @@ def decide_fan_state(readings, current_state):
     # block dehumidify-only mode whenever inside is too hot - in that
     # state we'd rather actively cool (if outside allows) or do
     # nothing, rather than vent via an unknown infiltration path.
-    dehumidify_blocked_by_hot_inside = inside_temp > 15.0  # headroom against warm house infiltration
+    dehumidify_blocked_by_hot_inside = inside_temp > TEMP_TARGET_MAX
 
     # Trigger dehumidify if inside humidity is above the floor (+
     # hysteresis if not already dehumidifying) - deliberately keeps
@@ -452,10 +367,10 @@ def decide_fan_state(readings, current_state):
     # Precise condensation/over-humidify check: would this outside air,
     # once it reaches cellar temperature, push inside RH above our
     # target ceiling? Uses absolute humidity rather than a flat dew
-    # point margin, so it's exact rather than approximated. Uses the
-    # strict ceiling (not cooling's dew-point override) since
-    # humidity control is dehumidify-only's entire purpose.
-    wont_overhumidify = outside_abs_humidity <= max_abs_humidity
+    # point margin, so it's exact rather than approximated. (Reuses
+    # the same calculation as the cooling branch above, since the
+    # physics are identical.)
+    wont_overhumidify = outside_abs_humidity <= max_abs_humidity_for_cooling
 
     outside_dewpoint_ok = outside_drier_than_inside and wont_overhumidify
 
@@ -473,8 +388,7 @@ def decide_fan_state(readings, current_state):
     # Runs the extractor alone, gambling that its makeup air is drawn
     # more from the adjoining (heated) house than from outside -
     # skipped if that gamble is blocked by cold outside air, or if
-    # outside has already exceeded TEMP_TARGET_MAX (infiltration could
-    # then overshoot the ceiling with no way to stop it).
+    # outside is too hot (same safety flag as everywhere else).
     if current_state == FANS_WARM_ASSIST:
         cold_trigger = inside_temp < WARMING_TEMP_CEILING
     else:
@@ -525,35 +439,38 @@ def _override_entry(overrides, fan_key):
 
 
 def resolve_extractor_override(readings, overrides, auto_value):
-    """Forced on/off both run until the user-chosen timer expires; violations
-    on a forced-on only warn, they don't revert."""
+    """Mirrors intake: timed if already hot at validation, untimed but instant-revert if clean."""
     entry = _override_entry(overrides, "extractor")
     if entry is None:
         return auto_value, False
 
-    now = datetime.now()
-
     if entry["state"] == "off":
-        entry["validated"] = True
-        expires_at = entry.get("expires_at")
-        if expires_at and now >= datetime.fromisoformat(expires_at):
-            print("Extractor override: manual-off timed out - reverting to auto")
-            del overrides["extractor"]
-            return auto_value, False
         return False, True
+
+    now = datetime.now()
 
     if not entry.get("validated"):
         entry["validated"] = True
         if evaluate_extractor_violation(readings):
+            timeout = MANUAL_EXTRACTOR_HOT_TIMEOUT_SECONDS
             outside_temp = readings["outside_temp"]
             inside_temp = readings["inside_temp"]
-            print(f"Extractor override: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C - warning only")
-            overrides["warning"] = f"Extractor forced on: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C"
+            entry["expires_at"] = (now + timedelta(seconds=timeout)).isoformat()
+            entry["reason"] = "temp"
+            print(f"Extractor override: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C - reverts in {timeout // 60} min")
+            overrides["warning"] = f"Extractor forced on: outside {outside_temp:.1f}\u00b0C > inside {inside_temp:.1f}\u00b0C \u2013 reverts in ~{timeout // 60} min"
         return True, True
 
     expires_at = entry.get("expires_at")
-    if expires_at and now >= datetime.fromisoformat(expires_at):
-        print("Extractor override: timed out - reverting to auto")
+    if expires_at:
+        if now >= datetime.fromisoformat(expires_at):
+            print("Extractor override: timed out - reverting to auto")
+            del overrides["extractor"]
+            return auto_value, False
+        return True, True
+
+    if evaluate_extractor_violation(readings):
+        print("Extractor override: hot-outside check hit - reverting to auto")
         del overrides["extractor"]
         return auto_value, False
 
@@ -561,9 +478,20 @@ def resolve_extractor_override(readings, overrides, auto_value):
 
 
 def resolve_intake_override(readings, overrides, auto_value, extractor_on_result):
-    """Forced on runs until user-chosen timer expires; violations warn but don't revert.
-    Forced off still reverts instantly if it leaves the extractor running alone and
-    outside is hot (uncontrolled infiltration risk).
+    """Apply a manual intake override on top of the auto decision.
+
+    Forcing OFF is safe UNLESS it leaves the extractor running alone
+    (negative pressure / unknown-source infiltration) - in that case
+    it's watched exactly like an extractor-alone override and reverts
+    instantly (no timer) if outside becomes hotter than our ideal max.
+
+    Forcing ON is checked against evaluate_intake_violation(): if it
+    was already violating a check the first time we see it, it's
+    accepted but bounded by a timeout (flat 5 min for a temp
+    violation, scaled 30 min-2 hr for a humidity violation); if it was
+    clean, it runs untimed but reverts to auto instantly the moment a
+    violation later appears - no benefit of the doubt for a risk that
+    wasn't there when it was turned on.
 
     Mutates `overrides` in place. Returns (intake_on, is_manual)."""
     entry = _override_entry(overrides, "intake")
@@ -577,12 +505,6 @@ def resolve_intake_override(readings, overrides, auto_value, extractor_on_result
             print("Intake-off override: extractor alone, hot-outside check hit - reverting to auto")
             del overrides["intake"]
             return auto_value, False
-        entry["validated"] = True
-        expires_at = entry.get("expires_at")
-        if expires_at and now >= datetime.fromisoformat(expires_at):
-            print("Intake-off override: timed out - reverting to auto")
-            del overrides["intake"]
-            return auto_value, False
         return False, True
 
     if not entry.get("validated"):
@@ -592,6 +514,7 @@ def resolve_intake_override(readings, overrides, auto_value, extractor_on_result
             outside_temp = readings["outside_temp"]
             inside_temp = readings["inside_temp"]
             if violation == "temp":
+                timeout = MANUAL_TEMP_VIOLATION_TIMEOUT_SECONDS
                 if outside_temp < OUTSIDE_ABS_MIN_TEMP:
                     detail = f"outside {outside_temp:.1f}°C (min {OUTSIDE_ABS_MIN_TEMP:.1f}°C)"
                 elif outside_temp < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN):
@@ -599,14 +522,26 @@ def resolve_intake_override(readings, overrides, auto_value, extractor_on_result
                 else:
                     detail = f"outside {outside_temp:.1f}°C > inside {inside_temp:.1f}°C"
             else:
+                timeout = manual_humidity_timeout_seconds(readings["inside_humidity"])
                 detail = f"outside air too humid at {inside_temp:.1f}°C cellar"
-            print(f"Intake override: {violation} check – {detail} – warning only")
-            overrides["warning"] = f"Intake forced on: {detail}"
+            entry["expires_at"] = (now + timedelta(seconds=timeout)).isoformat()
+            entry["reason"] = violation
+            entry["timeout_seconds"] = timeout
+            print(f"Intake override: {violation} check – {detail} – reverts in {timeout / 60:.0f} min")
+            overrides["warning"] = f"Intake forced on: {detail} – reverts in ~{timeout / 60:.0f} min"
         return True, True
 
     expires_at = entry.get("expires_at")
-    if expires_at and now >= datetime.fromisoformat(expires_at):
-        print("Intake override: timed out - reverting to auto")
+    if expires_at:
+        if now >= datetime.fromisoformat(expires_at):
+            print("Intake override: timed out - reverting to auto")
+            del overrides["intake"]
+            return auto_value, False
+        return True, True
+
+    _violation = evaluate_intake_violation(readings)
+    if _violation is not None:
+        print(f"Intake override: {_violation} check hit - reverting to auto")
         del overrides["intake"]
         return auto_value, False
 
@@ -667,8 +602,6 @@ def _resolve_and_drive(readings, current_state):
     intake_on, intake_manual = resolve_intake_override(
         readings, overrides, auto_intake_on, extractor_on
     )
-    overrides["relay_extractor"] = extractor_on
-    overrides["relay_intake"] = intake_on
     if json.dumps(overrides, sort_keys=True) != before:
         write_override(overrides)
     drive_relays(extractor_on, intake_on)
@@ -677,7 +610,8 @@ def _resolve_and_drive(readings, current_state):
 
 def main():
     current_state = FANS_OFF
-    polls_since_log = 0
+    state_started_at = time.monotonic()
+    last_log_at = time.monotonic()
     extractor_polls_on = 0
     intake_polls_on = 0
     polls_this_interval = 0
@@ -688,88 +622,88 @@ def main():
 
     try:
         while True:
-            # Everything for one poll cycle lives inside this inner
-            # try/except. Previously an unexpected exception ANYWHERE
-            # in here - a corrupt override file, a library error we
-            # didn't anticipate, anything not already handled more
-            # specifically - would propagate straight past this loop,
-            # hit `finally: GPIO.cleanup()`, and kill the whole script.
-            # Nothing would be written to sensor_errors.log in that
-            # case (it's not a sensor read failure), so the process
-            # would just silently disappear until something (systemd,
-            # or a person) noticed and restarted it - a much likelier
-            # explanation for an occasional unexplained gap with an
-            # EMPTY error log than the sensor retry path itself.
-            # Logging it via log_control_error and continuing turns
-            # that into one skipped cycle with a clear record of what
-            # happened, instead of a silent crash.
-            try:
-                poll_start = time.monotonic()
-                polls_since_log += 1
-                readings = read_sensors_with_retry()
+            poll_start = time.monotonic()
+            readings = read_sensors()
 
-                if readings is not None:
-                    last_readings = readings
-                    desired_state = decide_fan_state(readings, current_state)
+            if readings is not None:
+                last_readings = readings
+                desired_state = decide_fan_state(readings, current_state)
 
-                    if desired_state != current_state:
-                        print(
-                            f"Auto state change: {current_state} -> {desired_state} | "
-                            f"inside={readings['inside_temp']:.1f}C/{readings['inside_humidity']:.1f}% "
-                            f"outside={readings['outside_temp']:.1f}C/{readings['outside_humidity']:.1f}%"
-                        )
-                        current_state = desired_state
+                # Only switching *away* from an active state is guarded; switching in from OFF is not.
+                # Safety-triggered transitions (outside crossed a hard limit) bypass the guard.
+                time_in_state = time.monotonic() - state_started_at
+                _ot = readings["outside_temp"]
+                _it = readings["inside_temp"]
+                safety_triggered = (
+                    _ot < OUTSIDE_ABS_MIN_TEMP
+                    or _ot < (COOLING_TEMP_FLOOR - OUTSIDE_MIN_TEMP_MARGIN)
+                    or (_ot > _it and current_state in (FANS_COOLING, FANS_DEHUMIDIFY))
+                    or (_ot > TEMP_TARGET_MAX and current_state == FANS_WARM_ASSIST)
+                )
+                if (
+                    current_state != FANS_OFF
+                    and desired_state != current_state
+                    and time_in_state < MIN_RUN_SECONDS
+                    and not safety_triggered
+                ):
+                    print(
+                        f"Holding {current_state} - min run time not yet reached "
+                        f"({time_in_state:.0f}s / {MIN_RUN_SECONDS}s)"
+                    )
+                    new_state = current_state
+                else:
+                    new_state = desired_state
 
-                    extractor_on, intake_on, is_manual = _resolve_and_drive(readings, current_state)
+                if new_state != current_state:
+                    print(
+                        f"Auto state change: {current_state} -> {new_state} | "
+                        f"inside={readings['inside_temp']:.1f}C/{readings['inside_humidity']:.1f}% "
+                        f"outside={readings['outside_temp']:.1f}C/{readings['outside_humidity']:.1f}%"
+                    )
+                    current_state = new_state
+                    state_started_at = time.monotonic()
 
-                    new_display_state = "manual" if is_manual else current_state
-                    if new_display_state != display_state:
-                        print(f"Fan mode: {display_state} -> {new_display_state}")
-                        display_state = new_display_state
+                extractor_on, intake_on, is_manual = _resolve_and_drive(readings, current_state)
 
-                    # Poll counts use the actual post-override relay state.
-                    polls_this_interval += 1
-                    if extractor_on:
-                        extractor_polls_on += 1
-                    if intake_on:
-                        intake_polls_on += 1
+                new_display_state = "manual" if is_manual else current_state
+                if new_display_state != display_state:
+                    print(f"Fan mode: {display_state} -> {new_display_state}")
+                    display_state = new_display_state
 
-                # Log-interval check runs every cycle regardless of
-                # whether THIS cycle's sensor read succeeded, using
-                # whatever the most recent good reading was
-                # (last_readings) - keeps the CSV log cadence tied to
-                # poll count rather than to sensor read luck.
-                if last_readings is not None and polls_since_log >= LOG_EVERY_N_POLLS:
+                # Poll counts use the actual post-override relay state.
+                polls_this_interval += 1
+                if extractor_on:
+                    extractor_polls_on += 1
+                if intake_on:
+                    intake_polls_on += 1
+
+                now = time.monotonic()
+                if now - last_log_at >= LOG_INTERVAL_SECONDS:
                     log_reading(
-                        last_readings,
+                        readings,
                         display_state,
                         extractor_polls_on,
                         intake_polls_on,
                         polls_this_interval,
                     )
-                    polls_since_log = 0
+                    last_log_at = now
                     extractor_polls_on = 0
                     intake_polls_on = 0
                     polls_this_interval = 0
 
-                # ── Check for new override requests between full sensor polls ──
-                while True:
-                    remaining = POLL_INTERVAL_SECONDS - (time.monotonic() - poll_start)
-                    if remaining <= 0:
-                        break
-                    time.sleep(min(OVERRIDE_CHECK_SECONDS, remaining))
-                    if last_readings is None:
-                        continue
-                    _, _, is_manual = _resolve_and_drive(last_readings, current_state)
-                    new_display_state = "manual" if is_manual else current_state
-                    if new_display_state != display_state:
-                        print(f"Fan mode: {display_state} -> {new_display_state}")
-                        display_state = new_display_state
-
-            except Exception as e:
-                print(f"Unexpected error in control loop: {e}")
-                log_control_error(e)
-                time.sleep(5)  # brief pause so a persistent bug can't spin-loop
+            # ── Check for new override requests between full sensor polls ──
+            while True:
+                remaining = POLL_INTERVAL_SECONDS - (time.monotonic() - poll_start)
+                if remaining <= 0:
+                    break
+                time.sleep(min(OVERRIDE_CHECK_SECONDS, remaining))
+                if last_readings is None:
+                    continue
+                _, _, is_manual = _resolve_and_drive(last_readings, current_state)
+                new_display_state = "manual" if is_manual else current_state
+                if new_display_state != display_state:
+                    print(f"Fan mode: {display_state} -> {new_display_state}")
+                    display_state = new_display_state
 
     except KeyboardInterrupt:
         print("Stopping - cleaning up GPIO.")

@@ -24,7 +24,7 @@ TEMP_TARGET_MAX = 17.5      # °C - ideal cellar maximum
 # the ideal band. Banking extra cooling whenever it's free (instead
 # of stopping the moment it's "good enough") gives more thermal
 # margin to burn through once a heatwave takes that opportunity away.
-COOLING_TEMP_FLOOR = 11.0    # °C - stop opportunistic cooling here
+COOLING_TEMP_FLOOR = 12.5    # °C - stop opportunistic cooling here
 
 HUMIDITY_TARGET_MIN = 65.0  # % - stop opportunistic dehumidify here
 HUMIDITY_TARGET_MAX = 80.0  # %

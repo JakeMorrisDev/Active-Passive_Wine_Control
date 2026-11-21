@@ -92,7 +92,7 @@ ADVANTAGE_SCALE_RANGE = 3.0        # °C of off-target-ness over which the requi
 # actual moisture content of the air, unlike RH (which rises at night
 # purely because temperature drops, even with no change in moisture).
 # Using dew point avoids being fooled by that relative-humidity effect.
-OUTSIDE_DEWPOINT_ADVANTAGE = 1.0  # °C
+OUTSIDE_DEWPOINT_ADVANTAGE = 2.5  # °C
 
 # Cooling normally must pass max_allowable_abs_humidity()'s ceiling to
 # run - but once the cellar is hot enough, cooling takes priority over
